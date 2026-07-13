@@ -1,0 +1,27 @@
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Reports
+Report/
+
+# Logs
+*.log
+*.txt
+
+# Zip files
+*.zip
+
+# Word documents
+*.doc
+*.docx
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
