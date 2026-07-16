@@ -6,17 +6,25 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 import campaign_selectors
-import easyocr
+
+from utils.report_generator import generate_email_campaign_report
+from utils.vision_analyser import read_ocr_tokens
+from utils.ss_paths import (
+    email_screenshot_path,
+    smtp_change_screenshot_path,
+    success_screenshot_path,
+    toast_screenshot_path,
+    error_screenshot_path as build_error_screenshot_path,
+    misc_screenshot_path,
+)
 
 
 # ==========================================
 # 1. INITIALIZATION & FOLDER SETUP
 # ==========================================
-# Create parent folder for reports and screenshots
 PARENT_REPORT_DIR = "Report"
 os.makedirs(PARENT_REPORT_DIR, exist_ok=True)
 
-# Create a subfolder inside Report for this test run (dynamically increments Test 1, Test 2, etc.)
 import re
 test_num = 1
 if os.path.exists(PARENT_REPORT_DIR):
@@ -33,7 +41,6 @@ os.makedirs(RUN_DIR, exist_ok=True)
 
 RUN_SCREENSHOT_DIR = RUN_DIR
 
-# Generate a unique timestamp for logging and creating unique campaign names
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file_path = os.path.join(RUN_DIR, f"execution_log_{timestamp}.txt")
 
@@ -46,15 +53,113 @@ def log_message(message):
         f.write(log_line + "\n")
 
 
+# ==========================================
+# PIPELINE STEP TRACKING (for the HTML report's "Pipeline Steps" section)
+# ==========================================
+PIPELINE_STEPS = []
+BUG_SUMMARY = []
+
+
+def record_step(title, notes="", status="PASS"):
+    """Appends one entry to PIPELINE_STEPS. This drives the numbered
+    'Pipeline Steps — N Steps' table in the execution report, mirroring
+    the Call automation suite's report format. Call this right after a
+    meaningful action succeeds, or from an except block with status="FAIL"
+    and notes=<error message> when one fails."""
+    step_num = len(PIPELINE_STEPS) + 1
+    PIPELINE_STEPS.append({
+        "num": step_num,
+        "title": title,
+        "notes": notes,
+        "status": status,
+    })
+    suffix = f" — {notes}" if notes else ""
+    log_message(f"[STEP {step_num:02d}] {title} ({status}){suffix}")
+
+
+def record_bug_check(label, mode, status, note):
+    """Store a dedicated regression verdict for the report's bug table."""
+    BUG_SUMMARY.append({"label": label, "mode": mode.upper(), "status": status, "note": note})
+    log_message(f"[BUG CHECK] {label} [{mode.upper()}] ({status}) — {note}")
+
+
+def _toggle_is_on(toggle):
+    state = (toggle.get_attribute("aria-checked") or "").lower()
+    classes = (toggle.get_attribute("class") or "").lower()
+    thumb_classes = ""
+    try:
+        thumb_classes = (toggle.find_element(By.XPATH, ".//span").get_attribute("class") or "").lower()
+    except Exception:
+        pass
+    return state == "true" or "bg-blue-500" in classes or "bg-indigo-500" in classes or "translate-x-6" in thumb_classes
+
+
+def verify_advance_toggle_persistence(driver, campaign_type, combo_label):
+    """Run Bug #1 on the current edit form without creating a second campaign."""
+    label = "Advance Toggle Persist (Bug #1)"
+    mode = campaign_type.upper()
+    toggle_xpath = (
+        "//p[normalize-space()='Advance Campaign Setting']"
+        "/ancestor::div[contains(@class, 'flex')][1]//button[@type='button']"
+    )
+    try:
+        toggle = WebDriverWait(driver, 4).until(EC.presence_of_element_located((By.XPATH, toggle_xpath)))
+    except Exception:
+        record_bug_check(label, mode, "SKIPPED", f"{combo_label}: Advance Campaign Setting is not available in this email campaign form.")
+        return
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", toggle)
+        if not _toggle_is_on(toggle):
+            _safe_click(toggle)
+            time.sleep(0.8)
+        if not _toggle_is_on(toggle):
+            raise AssertionError("toggle did not turn ON")
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.8)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", toggle)
+        time.sleep(0.5)
+        if not _toggle_is_on(toggle):
+            raise AssertionError("toggle reset to OFF after scrolling")
+        record_bug_check(label, mode, "PASS", f"{combo_label}: toggle remained ON after scrolling away and back.")
+    except Exception as exc:
+        record_bug_check(label, mode, "FAIL", f"{combo_label}: {clean_exception(exc)}")
+
+
+def verify_wait_duration(driver, campaign_type, combo_label):
+    """Run Bug #2 against the currently visible sequence editor/form."""
+    label = "Wait Duration Persist (Bug #2)"
+    mode = campaign_type.upper()
+    try:
+        if campaign_type.lower() == "manual":
+            open_buttons = driver.find_elements(By.XPATH, "//button[contains(., 'Open Channel Sequence')]")
+            if open_buttons and open_buttons[0].is_displayed():
+                _safe_click(open_buttons[0])
+                time.sleep(1)
+        hours = driver.find_elements(By.XPATH, "//input[@aria-label='Wait hours']")
+        minutes = driver.find_elements(By.XPATH, "//input[contains(@aria-label, 'Wait minutes')]")
+        hours = [element for element in hours if element.is_displayed()]
+        minutes = [element for element in minutes if element.is_displayed()]
+        if not hours or not minutes:
+            record_bug_check(label, mode, "SKIPPED", f"{combo_label}: no visible Wait Duration controls found.")
+            return
+        hour_values = [(element.get_attribute("value") or "").strip() for element in hours]
+        minute_values = [(element.get_attribute("value") or "").strip() for element in minutes]
+        if all(value == "0" for value in hour_values) and all(value == "1" for value in minute_values):
+            record_bug_check(label, mode, "PASS", f"{combo_label}: wait duration persisted as 0 hours and 1 minute.")
+        else:
+            record_bug_check(label, mode, "FAIL", f"{combo_label}: expected 0h/1m; found hours={hour_values}, minutes={minute_values}.")
+    except Exception as exc:
+        record_bug_check(label, mode, "FAIL", f"{combo_label}: {clean_exception(exc)}")
+
+
 def clean_exception(exc):
     """Extract a clean, concise string description of the exception, stripping out chromedriver stack traces."""
     exc_type = type(exc).__name__
     exc_str = str(exc)
-    
-    # Try to extract from exc.msg if it's a Selenium exception
+
     msg = getattr(exc, 'msg', '') or exc_str
-    
-    # Clean up stacktrace from message
+
     if "stacktrace" in msg.lower():
         for marker in ["stacktrace:", "stacktrace", "stack trace:", "stack trace"]:
             if marker in msg.lower():
@@ -62,17 +167,15 @@ def clean_exception(exc):
                 if idx != -1:
                     msg = msg[:idx]
                 break
-                
+
     msg = msg.strip()
-    # Strip leading "Message:" or "Exception:" if present
     for prefix in ["message:", "exception:"]:
         if msg.lower().startswith(prefix):
             msg = msg[len(prefix):].strip()
-            
-    # If the message is empty or generic, return exception type name
+
     if not msg or msg.lower() in ["message", "exception", "error"]:
         return exc_type
-        
+
     return f"{exc_type}: {msg}"
 
 
@@ -93,610 +196,9 @@ def clean_traceback(tb_str):
     return "\n".join(cleaned_lines)
 
 
-def is_table_line(line):
-    stripped = line.strip()
-    if not stripped:
-        return False
-    if stripped.startswith('|'):
-        return True
-    if stripped.count('|') >= 2:
-        return True
-    char_set = set(stripped.replace(' ', ''))
-    if char_set.issubset({'-', ':', '|'}) and len(char_set) > 0 and '-' in char_set:
-        return True
-    return False
-
-
-def process_table_block(table_lines):
-    def is_divider_line(l):
-        s = l.strip().replace('|', '').replace('-', '').replace(':', '').replace(' ', '')
-        return len(s) == 0 and '-' in l
-        
-    clean_lines = [l for l in table_lines if not is_divider_line(l)]
-    if not clean_lines:
-        return ""
-        
-    header_line = clean_lines[0]
-    headers = [col.strip() for col in header_line.split('|') if col.strip() != '']
-    if not headers:
-        headers = [col.strip() for col in header_line.split('|')][1:-1]
-        
-    html = '<table style="border-collapse: collapse; width: 100%; margin: 15px 0; font-family: \'Segoe UI\', Arial, sans-serif; border: 1px solid #E5E7E9; font-size: 13px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);">'
-    html += '<thead><tr style="background: linear-gradient(135deg, #1F618D, #2C3E50); color: white;">'
-    for h in headers:
-        html += f'<th style="padding: 10px 12px; text-align: left; font-weight: 600; border: 1px solid #BDC3C7;">{h}</th>'
-    html += '</tr></thead><tbody>'
-    
-    row_idx = 0
-    for line in clean_lines[1:]:
-        cols = [col.strip() for col in line.split('|')]
-        if len(cols) > 1 and cols[0] == '':
-            cols = cols[1:]
-        if len(cols) > 0 and cols[-1] == '':
-            cols = cols[:-1]
-            
-        if not cols:
-            continue
-            
-        bg_color = "#F8F9F9" if row_idx % 2 == 0 else "#FFFFFF"
-        html += f'<tr style="background-color: {bg_color}; border-bottom: 1px solid #E5E7E9;">'
-        
-        while len(cols) < len(headers):
-            cols.append('')
-        cols = cols[:len(headers)]
-        
-        for col in cols:
-            val = col
-            val_upper = val.upper()
-            if "PASS" in val_upper:
-                val = '<span style="background-color: #D4EFDF; color: #196F3D; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 11px; display: inline-block;">PASS</span>'
-            elif "FAIL" in val_upper:
-                val = '<span style="background-color: #FADBD8; color: #78281F; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 11px; display: inline-block;">FAIL</span>'
-            html += f'<td style="padding: 10px 12px; border: 1px solid #E5E7E9; color: #2C3E50;">{val}</td>'
-        html += '</tr>'
-        row_idx += 1
-        
-    html += '</tbody></table>'
-    return html
-
-
-def parse_markdown_to_rich_html(text):
-    lines = text.split('\n')
-    processed_lines = []
-    in_table = False
-    table_lines = []
-    
-    for line in lines:
-        if is_table_line(line):
-            in_table = True
-            table_lines.append(line)
-        else:
-            if in_table:
-                html_table = process_table_block(table_lines)
-                processed_lines.append(html_table)
-                table_lines = []
-                in_table = False
-            processed_lines.append(line)
-            
-    if in_table:
-        html_table = process_table_block(table_lines)
-        processed_lines.append(html_table)
-        
-    import re
-    result_lines = []
-    for line in processed_lines:
-        if line.startswith('<table') or line.endswith('</table>'):
-            result_lines.append(line)
-            continue
-            
-        line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
-        line = re.sub(r'^\s*###\s*(.*?)$', r'<h3>\1</h3>', line)
-        line = re.sub(r'^\s*##\s*(.*?)$', r'<h2>\1</h2>', line)
-        line = re.sub(r'^\s*#\s*(.*?)$', r'<h1>\1</h1>', line)
-        line = re.sub(r'^\s*[\-\*]\s*(.*?)$', r'<li>\1</li>', line)
-        result_lines.append(line)
-        
-    return '<br>'.join(result_lines)
-
-
-def generate_email_table():
-    import html as py_html
-    html = """<table style="border-collapse: collapse; width: 100%; max-width: 600px; margin: 20px 0; font-family: 'Segoe UI', Arial, sans-serif; box-shadow: 0 4px 10px rgba(0,0,0,0.08); border-radius: 10px; overflow: hidden; border: 1px solid #E5E7E9;">
-    <thead>
-        <tr style="background: linear-gradient(135deg, #1B4F72, #2C3E50); color: white; border-bottom: 3px solid #1A5276;">
-            <th style="padding: 14px 18px; text-align: left; font-weight: 600; font-size: 14px; letter-spacing: 0.5px;">Test Case</th>
-            <th style="padding: 14px 18px; text-align: center; font-weight: 600; font-size: 14px; letter-spacing: 0.5px; width: 110px;">Pass/Fail</th>
-            <th style="padding: 14px 18px; text-align: right; font-weight: 600; font-size: 14px; letter-spacing: 0.5px; width: 120px;">Time Taken</th>
-        </tr>
-    </thead>
-    <tbody>"""
-    
-    row_idx = 0
-    for test_name in test_results.keys():
-        status_raw = test_results[test_name]
-        duration = test_durations.get(test_name, 0.0)
-        
-        is_pass = "PASS" in status_raw.upper()
-        if is_pass:
-            status_html = '<span style="background-color: #D4EFDF; color: #196F3D; padding: 4px 10px; border-radius: 12px; font-weight: bold; font-size: 12px; display: inline-block;">PASS</span>'
-            error_html = ""
-        else:
-            status_html = '<span style="background-color: #FADBD8; color: #78281F; padding: 4px 10px; border-radius: 12px; font-weight: bold; font-size: 12px; display: inline-block;">FAIL</span>'
-            
-            error_msg = ""
-            if " - Error: " in status_raw:
-                error_msg = status_raw.split(" - Error: ", 1)[1]
-            elif "Error:" in status_raw:
-                error_msg = status_raw.split("Error:", 1)[1]
-            else:
-                stripped = status_raw.strip()
-                if stripped.upper() not in ["FAIL", "FAILED"]:
-                    error_msg = stripped
-            
-            if error_msg:
-                escaped_error = py_html.escape(error_msg)
-                error_html = f'<div style="color: #78281F; font-size: 11px; margin-top: 6px; font-family: Consolas, Monaco, monospace; background-color: #FADBD8; padding: 6px 10px; border-radius: 4px; border-left: 3px solid #78281F; text-align: left; word-break: break-word; line-height: 1.4;">{escaped_error}</div>'
-            else:
-                error_html = ""
-            
-        bg_color = "#F8F9F9" if row_idx % 2 == 0 else "#FFFFFF"
-        html += f"""
-        <tr style="background-color: {bg_color}; border-bottom: 1px solid #E5E7E9;">
-            <td style="padding: 12px 18px; color: #2C3E50; font-size: 14px; font-weight: 500; vertical-align: top;">
-                {test_name}
-                {error_html}
-            </td>
-            <td style="padding: 12px 18px; text-align: center; vertical-align: top;">{status_html}</td>
-            <td style="padding: 12px 18px; text-align: right; color: #566573; font-size: 14px; font-family: monospace; vertical-align: top;">{duration}s</td>
-        </tr>"""
-        row_idx += 1
-        
-    html += """
-    </tbody>
-</table>"""
-    return html
-
-
-def send_report_email():
-    """Zip all screenshots and send them along with HTML body and Summary Report.doc via SMTP."""
-    import zipfile
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    from email.mime.base import MIMEBase
-    from email import encoders
-
-    recipient_email = env_vars.get("REPORT_RECIPIENT_EMAIL")
-    sender_email = env_vars.get("SENDER_EMAIL", "jetissha_gautam@technologymindz.com")
-    sender_password = env_vars.get("SENDER_PASSWORD")
-    smtp_server = env_vars.get("SMTP_SERVER", "smtp-mail.outlook.com")
-    smtp_port = int(env_vars.get("SMTP_PORT", 587))
-
-    if not recipient_email or not sender_email or not sender_password:
-        log_message("Warning: Email reporting skipped. Missing recipient, sender email, or sender password in .env.")
-        return False
-
-    log_message("Preparing email report...")
-    
-    # 1. Zip all screenshots in RUN_DIR
-    zip_path = os.path.join(RUN_DIR, f"campaign_validation_screenshots_{timestamp}.zip")
-    try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(RUN_DIR):
-                for file in files:
-                    if file.endswith('.png'):
-                        file_path = os.path.join(root, file)
-                        zipf.write(file_path, arcname=file)
-        log_message("Created screenshots zip archive.")
-    except Exception as zip_err:
-        log_message(f"Failed to create screenshots zip: {clean_exception(zip_err)}")
-        return False
-
-    # 2. Load the AI summary report if it exists
-    ai_report_path = os.path.join(RUN_DIR, f"ai_summary_report_{timestamp}.txt")
-    ai_body = ""
-    if os.path.exists(ai_report_path):
-        try:
-            with open(ai_report_path, "r", encoding="utf-8") as rf:
-                ai_body = rf.read()
-        except Exception:
-            pass
-
-    # 3. Construct HTML email body
-    import re
-    if ai_body:
-        # Programmatically clean "Prepared by: AI QA Automation Assistant" or similar sign-offs
-        ai_body = re.sub(
-            r"(?i)prepared\s+by\s*:\s*(?:enterprise\s+)?ai\s+qa\s+automation\s+assistant\b",
-            "",
-            ai_body
-        )
-        ai_body = re.sub(
-            r"(?i)prepared\s+by\s*:\s*ai\s+assistant\b",
-            "",
-            ai_body
-        )
-        ai_body = ai_body.strip()
-    ai_body_html = ""
-    if ai_body:
-        formatted_body = parse_markdown_to_rich_html(ai_body)
-        ai_body_html = f"""
-        <div style="background-color: #FDFDFD; border: 1px solid #E5E7E9; border-radius: 8px; padding: 20px; margin-top: 25px; box-shadow: 0 2px 5px rgba(0,0,0,0.02);">
-            <h2 style="color: #1B4F72; border-bottom: 2px solid #5DADE2; padding-bottom: 8px; margin-top: 0; font-size: 18px; font-weight: bold;">AI Executive Summary</h2>
-            <div style="font-size: 14px; color: #2C3E50; line-height: 1.6;">
-                {formatted_body}
-            </div>
-        </div>
-        """
-
-    total_time = round(time.time() - suite_start_time, 2)
-    critical_alert_html = ""
-    if critical_failure_occurred:
-        import html as py_html
-        escaped_msg = py_html.escape(critical_error_message)
-        escaped_tb = py_html.escape(clean_traceback(critical_error_traceback))
-        critical_alert_html = f"""
-        <div style="background-color: #FDEDEC; border: 1px solid #F5B7B1; border-left: 5px solid #C0392B; border-radius: 8px; padding: 20px; margin-bottom: 25px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-            <h2 style="color: #78281F; margin-top: 0; font-size: 16px; font-weight: bold;">⚠️ Critical Suite-Level Failure</h2>
-            <p style="font-size: 14px; color: #78281F; margin: 5px 0 10px 0;"><strong>Error:</strong> {escaped_msg}</p>
-            <details style="margin-top: 10px; cursor: pointer;">
-                <summary style="font-size: 13px; color: #566573; font-weight: 600;">View System Traceback</summary>
-                <pre style="background-color: #F9EBEA; padding: 12px; border-radius: 4px; font-size: 11px; color: #78281F; font-family: Consolas, Monaco, monospace; white-space: pre-wrap; margin-top: 8px; line-height: 1.4;">{escaped_tb}</pre>
-            </details>
-        </div>
-        """
-
-    email_html = f"""
-    <html>
-    <head>
-        <meta charset="utf-8">
-    </head>
-    <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #2C3E50; background-color: #F4F6F7; padding: 20px; margin: 0;">
-        <div style="max-width: 700px; background-color: #FFFFFF; border-radius: 10px; padding: 30px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); margin: 0 auto; border: 1px solid #E5E7E9;">
-            <div style="background: linear-gradient(135deg, #2E86C1, #1B4F72); color: white; padding: 20px 25px; border-radius: 8px; margin-bottom: 25px; box-shadow: 0 3px 6px rgba(0,0,0,0.05);">
-                <h1 style="margin: 0; font-size: 24px; font-weight: bold; color: #FFFFFF;">Campaign Validation Summary Report</h1>
-                <p style="margin: 5px 0 0 0; opacity: 0.9; font-size: 14px;">Test Run #{test_num} ({timestamp})</p>
-            </div>
-            
-            {critical_alert_html}
-            
-            <table style="width: 100%; border-collapse: collapse; margin-bottom: 25px; font-size: 14px; color: #34495E;">
-                <tr style="border-bottom: 1px solid #EAEDED;">
-                    <td style="padding: 8px 0; font-weight: bold; width: 180px; color: #2E86C1;">Total Execution Time:</td>
-                    <td style="padding: 8px 0; font-family: monospace; font-weight: 500;">{total_time}s</td>
-                </tr>
-                <tr style="border-bottom: 1px solid #EAEDED;">
-                    <td style="padding: 8px 0; font-weight: bold; color: #2E86C1;">Total Tests Executed:</td>
-                    <td style="padding: 8px 0; font-weight: bold;">{suite_summary['total_executed']}</td>
-                </tr>
-                <tr style="border-bottom: 1px solid #EAEDED;">
-                    <td style="padding: 8px 0; font-weight: bold; color: #27AE60;">Passed Tests:</td>
-                    <td style="padding: 8px 0; font-weight: bold; color: #27AE60;">{suite_summary['passed_tests']}</td>
-                </tr>
-                <tr style="border-bottom: 1px solid #EAEDED;">
-                    <td style="padding: 8px 0; font-weight: bold; color: #C0392B;">Failed Tests:</td>
-                    <td style="padding: 8px 0; font-weight: bold; color: #C0392B;">{suite_summary['failed_tests']}</td>
-                </tr>
-            </table>
-            
-            <h2 style="color: #1B4F72; border-bottom: 2px solid #AED6F1; padding-bottom: 8px; font-size: 18px; margin-top: 30px; font-weight: bold;">Individual Test Case Metrics</h2>
-            {generate_email_table()}
-            
-            {ai_body_html}
-            
-            <hr style="border: 0; border-top: 1px solid #E5E7E9; margin: 30px 0;">
-            <p style="font-size: 12px; color: #BDC3C7; text-align: center; margin: 0;">This is an automated campaign validation report generated by the Enterprise AI QA Automation framework.</p>
-        </div>
-    </body>
-    </html>
-    """
-
-    # 4. Construct the MIME message
-    msg = MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-    msg['Subject'] = f"Campaign Validation Report - Test Run {test_num} ({timestamp})"
-    
-    msg.attach(MIMEText(email_html, 'html'))
-
-    # Attach the screenshots zip file
-    if os.path.exists(zip_path):
-        try:
-            with open(zip_path, "rb") as attachment:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(attachment.read())
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename={os.path.basename(zip_path)}",
-                )
-                msg.attach(part)
-                log_message("Attached screenshots zip to email.")
-        except Exception as attach_err:
-            log_message(f"Failed to attach zip file to email: {clean_exception(attach_err)}")
-
-    # Attach the AI Executive Summary report (.doc) as "Summary Report.doc"
-    ai_doc_path = os.path.join(RUN_DIR, "Summary Report.doc")
-    if os.path.exists(ai_doc_path):
-        try:
-            with open(ai_doc_path, "rb") as df:
-                part = MIMEBase("application", "msword")
-                part.set_payload(df.read())
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    "attachment; filename=\"Summary Report.doc\"",
-                )
-                msg.attach(part)
-                log_message("Attached Summary Report.doc to email.")
-        except Exception as attach_err:
-            log_message(f"Failed to attach AI doc report to email: {clean_exception(attach_err)}")
-
-    # 5. Connect to SMTP server and send email
-    try:
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-        else:
-            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-            server.starttls()
-            
-        server.login(sender_email, sender_password)
-        server.send_message(msg)
-        server.quit()
-        log_message(f"Report email successfully sent to {recipient_email}.")
-        return True
-    except Exception as email_err:
-        log_message(f"Failed to send report email: {clean_exception(email_err)}")
-        return False
-
-
-def generate_ai_report():
-    """Reads execution log, constructs LLM prompt, and writes the report to a text file.
-    Includes GITHUB_TOKEN integration placeholders.
-    """
-    log_message("Generating AI execution summary report...")
-    
-    # 1. Read execution log
-    log_content = ""
-    if os.path.exists(log_file_path):
-        try:
-            with open(log_file_path, "r", encoding="utf-8") as lf:
-                log_content = lf.read()
-        except Exception as e:
-            log_content = f"Error reading log file: {str(e)}"
-    else:
-        log_content = "Log file not found."
-
-    # 2. Calculate execution times
-    total_time = round(time.time() - suite_start_time, 2)
-
-    # 3. Create structured prompt
-    prompt = f"""
-You are an expert QA Automation Assistant. Analyze the following Selenium test execution log and generate a professional, structured AI executive summary report.
-
-### Log Content:
-{log_content}
-
-### Execution Summary Data:
-- Total Execution Time: {total_time}s
-- Total Tests Executed: {suite_summary['total_executed']}
-- Passed Tests: {suite_summary['passed_tests']}
-- Failed Tests: {suite_summary['failed_tests']}
-"""
-    if suite_summary["failure_reasons"]:
-        prompt += "- Failure Reasons:\n"
-        for name, reason in suite_summary["failure_reasons"].items():
-            prompt += f"  * {name}: {reason}\n"
-            
-    prompt += "\n- Per-Test Durations:\n"
-    for test_name, duration in test_durations.items():
-        prompt += f"  - {test_name}: {duration}s\n"
-
-    prompt += "\n- Pass/Fail Status:\n"
-    for test_name, status in test_results.items():
-        prompt += f"  - {test_name}: {status}\n"
-
-    prompt += """
-Please generate a report that contains:
-1. Executive Summary: High-level overview of the automation run.
-2. Total Execution Time and Per-Test Duration.
-3. Pass/Fail Status and details of any failed tests.
-4. Errors (if any): Grouped by test case with description.
-5. Important Actions Performed: Major steps taken during the test flow.
-
-Do NOT write "Prepared by: AI QA Automation Assistant" or any other sign-offs/signatures at the end of the report.
-"""
-
-    log_message("Structured prompt created. Prompt preview:")
-    log_message(prompt[:500] + "...\n[Prompt Truncated for log display]")
-
-    # 4. GitHub Model API Integration
-    ai_report_content = ""
-    token = env_vars.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token and token.strip() and token.strip() != "YOUR_GITHUB_TOKEN":
-        try:
-            import json
-            import urllib.request
-            
-            endpoint = "https://models.inference.ai.azure.com/chat/completions"
-            model_name = "gpt-4o"  # default to gpt-4o which is widely available
-            
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0"
-            }
-            
-            data = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a QA assistant that summarizes execution logs."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "model": model_name,
-                "temperature": 0.7,
-                "max_tokens": 2048
-            }
-            
-            req = urllib.request.Request(
-                endpoint, 
-                data=json.dumps(data).encode("utf-8"), 
-                headers=headers,
-                method="POST"
-            )
-            
-            log_message(f"Sending request to GitHub Models API using model '{model_name}'...")
-            with urllib.request.urlopen(req, timeout=30) as response:
-                res_data = json.loads(response.read().decode("utf-8"))
-                ai_report_content = res_data["choices"][0]["message"]["content"]
-            log_message("AI summary report generated successfully from GitHub Models API.")
-        except Exception as api_err:
-            log_message(f"Error calling GitHub Models API: {clean_exception(api_err)}")
-            ai_report_content = f"Error during live GitHub API call: {clean_exception(api_err)}"
-    else:
-        # Fallback simulated response
-        log_message("GITHUB_TOKEN is empty or not configured. Using simulated report.")
-        ai_report_content = f"""AI EXECUTIVE SUMMARY REPORT (Simulated)
-=====================================
-Executive Summary:
-The email campaign automation suite execution completed with total verification.
-
-Metrics:
-- Total Execution Time: {total_time}s
-- Total Tests Executed: {suite_summary['total_executed']}
-- Passed Tests: {suite_summary['passed_tests']}
-- Failed Tests: {suite_summary['failed_tests']}
-"""
-        if suite_summary["failure_reasons"]:
-            ai_report_content += "\nFailure Reasons:\n"
-            for name, reason in suite_summary["failure_reasons"].items():
-                ai_report_content += f"  * {name}: {reason}\n"
-                
-        ai_report_content += "\nPer-Test Duration:\n"
-        for test_name, duration in test_durations.items():
-            ai_report_content += f"  * {test_name}: {duration}s\n"
-            
-        ai_report_content += "\nPass/Fail Status:\n"
-        for test_name, status in test_results.items():
-            ai_report_content += f"  * {test_name}: {status}\n"
-            
-        ai_report_content += "\nImportant Actions Performed:\n"
-        ai_report_content += "  - Logged into the Enterprise AI Platform successfully.\n"
-        ai_report_content += "  - Created lead list and configured SMTP settings.\n"
-        ai_report_content += "  - Completed campaign execution and cleared created assets.\n"
-        ai_report_content += "\n[Note: GITHUB_TOKEN is not configured in .env. Fill in the token to enable live AI summaries.]"
-
-    # Save to file
-    ai_report_path = os.path.join(RUN_DIR, f"ai_summary_report_{timestamp}.txt")
-    ai_doc_path = os.path.join(RUN_DIR, "Summary Report.doc")
-    try:
-        # 1. Save as plain text
-        with open(ai_report_path, "w", encoding="utf-8") as rf:
-            rf.write(ai_report_content)
-        log_message(f"AI report written to: {ai_report_path}")
-        
-        # 2. Save as HTML-based .doc for rich formatting in Microsoft Word
-        html_body = parse_markdown_to_rich_html(ai_report_content)
-        
-        # Generate screenshots section html
-        screenshots_html = ""
-        login_success_img = "01_Login_Success.png"
-        login_success_path = os.path.join(RUN_DIR, login_success_img)
-        if os.path.exists(login_success_path):
-            screenshots_html += f"""
-            <div style="margin-top: 25px; margin-bottom: 25px; page-break-inside: avoid;">
-                <h3 style="color: #2E86C1; border-bottom: 1px solid #AED6F1; padding-bottom: 4px; font-size: 14px;">User Authentication Success Screenshot</h3>
-                <p style="font-size: 12px; color: #7F8C8D; margin: 4px 0 10px 0;">Screenshot captured immediately after successful login to the platform dashboard.</p>
-                <img src="{login_success_img}" style="border: 1px solid #BDC3C7; border-radius: 4px; max-width: 600px;" width="600">
-            </div>
-            """
-            
-        for r in combinations_results:
-            prov = r.get("provider", "").upper()
-            camp = r.get("campaign_type", "").upper()
-            status = r.get("status", "FAIL")
-            
-            smtp_screenshot = r.get("smtp_screenshot", "")
-            final_screenshot = r.get("screenshot", "")
-            
-            if smtp_screenshot or final_screenshot:
-                screenshots_html += f"""
-                <div style="margin-top: 30px; margin-bottom: 30px; page-break-inside: avoid; border-top: 1px dashed #BDC3C7; padding-top: 15px;">
-                    <h3 style="color: #1B4F72; font-size: 14px; margin-bottom: 8px;">Combination Validation: {prov} - {camp} (Status: {status})</h3>
-                """
-                
-                if smtp_screenshot and os.path.exists(smtp_screenshot):
-                    smtp_filename = os.path.basename(smtp_screenshot)
-                    screenshots_html += f"""
-                    <div style="margin-bottom: 15px;">
-                        <p style="font-size: 12px; color: #7F8C8D; margin: 0 0 5px 0;"><strong>SMTP Configuration Change:</strong> Default provider set to {prov} in settings.</p>
-                        <img src="{smtp_filename}" style="border: 1px solid #BDC3C7; border-radius: 4px; max-width: 600px;" width="600">
-                    </div>
-                    """
-                    
-                if final_screenshot and os.path.exists(final_screenshot):
-                    final_filename = os.path.basename(final_screenshot)
-                    outcome = "Successful execution" if status == "PASS" else f"Execution failure (Error: {r.get('error_message', 'TimeoutError')})"
-                    screenshots_html += f"""
-                    <div style="margin-bottom: 15px;">
-                        <p style="font-size: 12px; color: #7F8C8D; margin: 0 0 5px 0;"><strong>Campaign Execution Status:</strong> {outcome}</p>
-                        <img src="{final_filename}" style="border: 1px solid #BDC3C7; border-radius: 4px; max-width: 600px;" width="600">
-                    </div>
-                    """
-                
-                screenshots_html += "</div>"
-        
-        doc_html = f"""<html>
-<head>
-<meta charset="utf-8">
-<style>
-body {{ font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; color: #2C3E50; }}
-h1 {{ color: #1B4F72; border-bottom: 2px solid #5DADE2; padding-bottom: 8px; margin-top: 25px; }}
-h2 {{ color: #2E86C1; border-bottom: 1px solid #AED6F1; padding-bottom: 5px; margin-top: 20px; }}
-h3 {{ color: #3498DB; margin-top: 15px; }}
-ul {{ padding-left: 20px; }}
-li {{ margin-bottom: 6px; }}
-p {{ margin: 10px 0; }}
-b {{ color: #1F618D; }}
-.header {{ background-color: #EBF5FB; border-left: 5px solid #3498DB; padding: 15px; margin-bottom: 20px; border-radius: 4px; }}
-</style>
-</head>
-<body>
-<div class="header">
-    <h1 style="margin-top: 0; border: none; padding: 0; color: #1B4F72;">Summary Report</h1>
-    <p><strong>Generated on:</strong> {timestamp}</p>
-    <p><strong>Total Execution Time:</strong> {total_time}s</p>
-    <p><strong>Total Tests Executed:</strong> {suite_summary['total_executed']}</p>
-    <p><strong>Passed Tests:</strong> {suite_summary['passed_tests']}</p>
-    <p><strong>Failed Tests:</strong> {suite_summary['failed_tests']}</p>
-</div>
-{html_body}
-<h2 style="color: #1B4F72; border-bottom: 2px solid #5DADE2; padding-bottom: 8px; margin-top: 35px;">Execution Screenshots & Evidence</h2>
-{screenshots_html}
-</body>
-</html>"""
-        with open(ai_doc_path, "w", encoding="utf-8") as df:
-            df.write(doc_html)
-        log_message(f"AI Word Document report written to: {ai_doc_path}")
-        
-    except Exception as e:
-        log_message(f"Failed to write AI report files: {str(e)}")
-
-    return ai_report_content
-
-
-
 def dismiss_post_login_popup(driver, wait_time=15):
-    """Dismiss a post-login popup if it appears, without failing the test.
-    This function looks for common confirmation buttons like 'OK', 'Confirm', or 'Yes' in a case‑insensitive manner.
-    """
+    """Dismiss a post-login popup if it appears, without failing the test."""
     try:
-        # XPath matches buttons with text ok/confirm/yes regardless of case and trims surrounding whitespace
         ok_button = WebDriverWait(driver, wait_time).until(
             EC.element_to_be_clickable(
                 (By.XPATH,
@@ -706,13 +208,11 @@ def dismiss_post_login_popup(driver, wait_time=15):
                 )
             )
         )
-        # Scroll into view and click via JavaScript to avoid overlay issues
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", ok_button)
         driver.execute_script("arguments[0].click();", ok_button)
         log_message("Dismissed login popup.")
         return True
     except Exception:
-        # No popup found or click failed; continue without breaking the flow
         return False
 
 # Load env variables from workspace
@@ -726,56 +226,50 @@ if os.path.exists(env_path):
                 key, val = line.split("=", 1)
                 env_vars[key.strip()] = val.strip().strip('"').strip("'")
 
-# Environment Configurations
-TARGET_URL = env_vars.get("TARGET_URL", "https://fms-aisdr-agent1.technologymindz.com/")
-USER_ID = env_vars.get("USER_ID", "superadmin@gmail.com")
-PASSWORD = env_vars.get("PASSWORD") or os.environ.get("PASSWORD")
+TARGET_URL = env_vars.get("BASE_URL", "https://fms-aisdr-agent1.technologymindz.com/")
+USER_ID = env_vars.get("APP_USERNAME", "superadmin@gmail.com")
+PASSWORD = env_vars.get("APP_PASSWORD") or os.environ.get("APP_PASSWORD")
 
 if not PASSWORD:
     log_message("Warning: PASSWORD is not set in .env or environment variables.")
 
 log_message("Starting campaign validation...")
 
-# Initialize Chrome WebDriver with disabled Password Manager & Leak Detection to prevent native warnings
 chrome_options = webdriver.ChromeOptions()
 chrome_options.add_experimental_option("prefs", {
     "profile.password_manager_leak_detection": False,
     "credentials_enable_service": False,
     "profile.password_manager_enabled": False
 })
-# Disable password protection features as arguments
 chrome_options.add_argument("--disable-features=SafeBrowsingPasswordProtection,SafeBrowsingPasswordProtectionService")
 
 driver = webdriver.Chrome(options=chrome_options)
 driver.maximize_window()
 
-# Time delays standard configuration
-IMPLICIT_WAIT_TIME = 10  # Standard fallback wait time for elements
-EXPLICIT_WAIT_TIME = 15  # Max time allowed for critical step validation
+IMPLICIT_WAIT_TIME = 10
+EXPLICIT_WAIT_TIME = 15
 driver.implicitly_wait(IMPLICIT_WAIT_TIME)
 
 list_name_base = env_vars.get("LEAD_LIST_NAME", "Automated_Lead_List")
-first_name = env_vars.get("LEAD_FIRST_NAME", "John")
-last_name = env_vars.get("LEAD_LAST_NAME", "Doe")
-lead_email = env_vars.get("LEAD_EMAIL", "john.doe@example.com")
+first_name = env_vars.get("LEAD_NAMES", "John")
+last_name = env_vars.get("LEAD_LAST_NAME", "")
+lead_email = env_vars.get("LEAD_EMAILS", "john.doe@example.com")
 lead_company = env_vars.get("LEAD_COMPANY", "Acme Corp")
+lead_id = env_vars.get("LEAD_ID", "LEAD001")
 smtp_provider = env_vars.get("SMTP_PROVIDER", "gmail")
 conversion_criteria_raw = env_vars.get("CONVERSION_CRITERIA", "Message Replied,Link Clicked")
 conversion_criteria = [c.strip() for c in conversion_criteria_raw.split(",") if c.strip()]
 
-# Dictionary to track test status for the final summary report
 test_results = {
     "Test 1 (Authentication)": "NOT RUN",
     "Lead List Creation": "NOT RUN"
 }
 
-# Timings and track state
 test_durations = {
     "Test 1 (Authentication)": 0.0,
     "Lead List Creation": 0.0
 }
 
-# Summary metrics for the 10 combinations
 suite_summary = {
     "total_executed": 0,
     "passed_tests": 0,
@@ -783,24 +277,63 @@ suite_summary = {
     "failure_reasons": {}
 }
 
-# Global list to hold provider combination results and their screenshot paths
 combinations_results = []
 
-# Global error flags to handle suite-level critical errors in the email
 critical_failure_occurred = False
 critical_error_message = ""
 critical_error_traceback = ""
-
-# EasyOCR reader initialized lazily
-ocr_reader = None
 
 suite_start_time = time.time()
 current_test_name = "Test 1 (Authentication)"
 current_test_start = time.time()
 
-
-# Define unique list name using main timestamp
 unique_list_name = f"{list_name_base}_{timestamp}"
+
+
+def _read_toast_text(screenshot_path):
+    """Runs the shared Tesseract reader on a toast screenshot and returns
+    (extracted_text, avg_confidence)."""
+    tokens = read_ocr_tokens(screenshot_path)
+    texts = [text for text, _, _ in tokens]
+    confs = [confidence for _, confidence, _ in tokens]
+    extracted_text = " ".join(texts).strip()
+    avg_conf = sum(confs) / len(confs) if confs else 0.0
+    return extracted_text, avg_conf
+
+
+def set_campaign_waits_to_one_minute(driver):
+    """Set every visible campaign sequence wait control to 00:01."""
+    hour_inputs = driver.find_elements(
+        By.XPATH,
+        "//span[translate(normalize-space(.), 'HOURS', 'hours')='hours']"
+        "/preceding-sibling::input[1] | "
+        "//label[contains(translate(normalize-space(.), 'HOURS', 'hours'), 'hours')]//input",
+    )
+    minute_inputs = driver.find_elements(
+        By.XPATH,
+        "//span[translate(normalize-space(.), 'MINUTES', 'minutes')='min' or "
+        "translate(normalize-space(.), 'MINUTES', 'minutes')='minutes']"
+        "/preceding-sibling::input[1] | "
+        "//label[contains(translate(normalize-space(.), 'MINUTES', 'minutes'), 'min')]//input",
+    )
+
+    changed = 0
+    for input_element in hour_inputs:
+        if input_element.is_displayed() and input_element.is_enabled():
+            input_element.clear()
+            input_element.send_keys("0")
+            changed += 1
+    for input_element in minute_inputs:
+        if input_element.is_displayed() and input_element.is_enabled():
+            input_element.clear()
+            input_element.send_keys("1")
+            changed += 1
+
+    if changed:
+        log_message(f"Campaign wait controls set to 00:01 ({changed} field(s) updated).")
+    else:
+        log_message("No visible campaign wait controls found to set to 00:01.")
+    return changed
 
 
 def _select_option_by_text(element, option_text, label_name):
@@ -868,13 +401,10 @@ def navigate_to_settings(driver):
 
 
 def reset_browser_state():
-    """Resets the browser to a clean state by navigating to the base URL or dashboard,
-    closing modals, or re-authenticating if logged out.
-    """
+    """Resets the browser to a clean state."""
     global driver
     log_message("Resetting browser session to a clean state...")
     try:
-        # Check and handle unexpected alert if present
         try:
             alert = driver.switch_to.alert
             alert_text = alert.text
@@ -885,8 +415,7 @@ def reset_browser_state():
 
         driver.get(TARGET_URL)
         time.sleep(2)
-        
-        # Re-authenticate if session is lost or redirects to login page
+
         if "login" in driver.current_url.lower():
             log_message("Session lost. Re-authenticating...")
             email_field = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
@@ -911,8 +440,7 @@ def reset_browser_state():
         driver = webdriver.Chrome(options=chrome_options)
         driver.maximize_window()
         driver.implicitly_wait(IMPLICIT_WAIT_TIME)
-        
-        # Log in again
+
         driver.get(TARGET_URL)
         email_field = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.visibility_of_element_located((By.NAME, "email"))
@@ -930,10 +458,9 @@ def create_shared_lead_list(driver, list_name):
     """Creates a shared lead list to be used across all test combinations."""
     log_message(f"Creating shared Lead List: {list_name}...")
     try:
-        # Navigate to settings to access the Lead configure section
         driver.get(TARGET_URL.rstrip('/') + "/setting")
         time.sleep(3)
-        
+
         leads_btn_clicked = False
         for attempt in range(3):
             try:
@@ -945,74 +472,73 @@ def create_shared_lead_list(driver, list_name):
                     break
             except Exception:
                 time.sleep(1.5)
-        
+
         if not leads_btn_clicked:
             raise RuntimeError("Could not click configure leads button.")
         time.sleep(2)
-        
+
         create_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Create')]"))
         )
         create_btn.click()
         time.sleep(1)
-        
+
         name_input = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.visibility_of_element_located((By.XPATH, "//input[@placeholder='e.g. Q2 Enterprise Targets']"))
         )
         name_input.send_keys(list_name)
-        
+
         excel_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Excel / CSV')]"))
         )
         excel_btn.click()
         time.sleep(0.5)
-        
+
         next_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'fixed')]//button[contains(., 'Next') or contains(., 'Continue')]"))
         )
         next_btn.click()
         time.sleep(2)
-        
-        # Generate CSV file
+
         headers = ['name', 'notes', 'tasks', 'title', 'company', 'lead_id', 'website', 'comments', 'industry', 'activities', 'add_prompt', 'attachments', 'client_type', 'description', 'lead_rating', 'lead_source', 'lead_status', 'address_city', 'linkedin_url', 'project_name', 'project_type', 'address_state', 'business_area', 'email_address', 'address_street', 'annual_revenue', 'contact_number', 'address_country', 'no_of_employees', 'address_zip_code', 'lead_owner_email', 'last_follow_up_date', 'reason_not_interested', 'reason_not_interested_other', '_lead_id', '_call_enabled', '_whatsapp_enabled', '_email_enabled', '_linkedin_enabled']
         lead_row = [''] * len(headers)
         lead_row[headers.index('name')] = f"{first_name} {last_name}"
         lead_row[headers.index('company')] = lead_company
         lead_row[headers.index('email_address')] = lead_email
-        lead_row[headers.index('lead_id')] = "LEAD-001"
-        lead_row[headers.index('_lead_id')] = "LEAD-001"
+        lead_row[headers.index('lead_id')] = lead_id
+        lead_row[headers.index('_lead_id')] = lead_id
         lead_row[headers.index('_call_enabled')] = "1"
         lead_row[headers.index('_whatsapp_enabled')] = "1"
         lead_row[headers.index('_email_enabled')] = "1"
         lead_row[headers.index('_linkedin_enabled')] = "1"
-        
+
         csv_temp_path = os.path.abspath(f"temp_leads_shared_{timestamp}.csv")
         import csv
         with open(csv_temp_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
             writer.writerow(lead_row)
-            
+
         file_input = driver.find_element(By.XPATH, "//input[@type='file']")
         file_input.send_keys(csv_temp_path)
         time.sleep(3)
-        
+
         import_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'fixed')]//button[contains(., 'Import')]"))
         )
         driver.execute_script("arguments[0].click();", import_btn)
         time.sleep(2)
-        
+
         WebDriverWait(driver, 30).until(
             EC.invisibility_of_element_located((By.XPATH, "//div[contains(@class, 'fixed')]//button[contains(., 'Import')]"))
         )
         time.sleep(2)
-        
+
         try:
             os.remove(csv_temp_path)
         except Exception:
             pass
-            
+
         WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.presence_of_element_located((By.XPATH, f"//tr[contains(., '{list_name}')]"))
         )
@@ -1025,10 +551,9 @@ def create_shared_lead_list(driver, list_name):
 def delete_shared_lead_list(driver, list_name):
     """Deletes the shared lead list at the end of the execution run."""
     log_message(f"Cleaning up shared lead list: {list_name}...")
-    # Navigate to settings page first and click Configure leads to safely load leads list view
     driver.get(TARGET_URL.rstrip('/') + "/setting")
     time.sleep(3)
-    
+
     leads_btn_clicked = False
     for attempt in range(3):
         try:
@@ -1040,11 +565,11 @@ def delete_shared_lead_list(driver, list_name):
                 break
         except Exception:
             time.sleep(1.5)
-            
+
     if not leads_btn_clicked:
         raise RuntimeError("Could not click configure leads button.")
     time.sleep(4)
-    
+
     delete_btn_xpaths = [
         f"//tr[contains(., '{list_name}')]//button[@title='Delete list']",
         f"//tr[contains(., '{list_name}')]//button[contains(@title,'Delete')]",
@@ -1063,10 +588,10 @@ def delete_shared_lead_list(driver, list_name):
                 break
         except Exception:
             continue
-            
+
     if not delete_btn:
         raise RuntimeError("Could not find delete button.")
-        
+
     delete_btn.click()
     confirm_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
         EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirm') or contains(.,'Yes')]"))
@@ -1076,49 +601,67 @@ def delete_shared_lead_list(driver, list_name):
     time.sleep(2)
 
 
-def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name, unique_list_name, preview_mode=False):
-    """Executes campaign creation steps up to clicking Run Campaign."""
-    # 1. Navigating to Settings to configure SMTP Provider
+def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name, unique_list_name):
+    """Executes campaign creation steps up to clicking Run Campaign.
+    Preview Mode is always enabled as part of every campaign creation now —
+    there is no separate 'bug check' campaign flow anymore. Also selects
+    'SMTP' from the Email Sender Platform dropdown (CRM / SMTP) before
+    picking the actual SMTP provider.
+    """
     log_message("Navigating to settings to configure default SMTP provider...")
     driver.get(TARGET_URL.rstrip('/') + "/setting")
-    time.sleep(3)
-    
+    time.sleep(4)
+
+    # 1a. Select "SMTP" from the Email Sender Platform dropdown (CRM / SMTP)
+    log_message("Selecting SMTP from Email Sender Platform dropdown...")
+    platform_select_xpath = (
+        "//p[contains(text(), 'Email Sender Platform')]"
+        "/ancestor::div[contains(@class, 'rounded-2xl')][1]//select"
+    )
+    platform_select_element = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+        EC.presence_of_element_located((By.XPATH, platform_select_xpath))
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", platform_select_element)
+    time.sleep(1)
+    Select(platform_select_element).select_by_value("SMTP")
+    time.sleep(2)
+    log_message("Email Sender Platform set to: SMTP")
+
     # Set SMTP provider dropdown
     select_element = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
         EC.presence_of_element_located((By.XPATH, "//label[contains(text(), 'Provider')]/following-sibling::div/select | //select[contains(., 'Select Provider')]"))
     )
+    time.sleep(1)
     Select(select_element).select_by_value(provider.lower())
-    time.sleep(1.5)
+    time.sleep(2.5)
     log_message(f"SMTP provider set to: {provider}")
-    
-    # Capture screenshot for SMTP provider change
+
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    smtp_screenshot_path = os.path.join(RUN_SCREENSHOT_DIR, f"SMTP_Change_{provider}_{campaign_type}_{run_timestamp}.png")
+    smtp_screenshot_path = smtp_change_screenshot_path(RUN_DIR, provider, campaign_type, run_timestamp)
     try:
         driver.save_screenshot(smtp_screenshot_path)
         log_message("Captured SMTP configuration change screenshot.")
     except Exception:
         smtp_screenshot_path = ""
-    
-    # 2. Campaign Creation
+
     log_message("Creating Campaign...")
     campaign_url = TARGET_URL.rstrip('/') + "/campaign"
     driver.get(campaign_url)
-    time.sleep(2)
-    
+    time.sleep(3)
+
     create_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
         EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Create New Campaign')]"))
     )
     _safe_click(create_btn)
-    time.sleep(1.5)
-    
-    # Select campaign mode
+    time.sleep(2.5)
+
     if campaign_type == "ai":
         log_message("Selecting AI Campaign mode...")
         ai_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, campaign_selectors.AI_CAMPAIGN_OPTION_SELECTOR))
         )
         _safe_click(ai_btn)
+        time.sleep(1.5)
         log_message("AI Campaign selected.")
     else:
         log_message("Selecting Manual Campaign mode...")
@@ -1126,16 +669,18 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Manual') and contains(., 'You define the channel sequence and steps for all leads')]"))
         )
         _safe_click(manual_btn)
+        time.sleep(1.5)
         log_message("Manual mode selected.")
-        
+
     campaign_name_field = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
         EC.visibility_of_element_located((By.NAME, "campaign_name"))
     )
     campaign_name_field.clear()
+    time.sleep(0.5)
     campaign_name_field.send_keys(unique_campaign_name)
+    time.sleep(1.5)
     log_message("Campaign name entered.")
 
-    # Configure campaign details: Select lead list
     if campaign_type == "ai":
         lead_list_xpath = campaign_selectors.AI_LEAD_LIST_BUTTON_SELECTOR
     else:
@@ -1145,24 +690,53 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
         EC.element_to_be_clickable((By.XPATH, lead_list_xpath))
     )
     _safe_click(lead_list_btn)
-    
+    time.sleep(1.5)
+
     our_list_option = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
         EC.element_to_be_clickable((By.XPATH, f"//button[contains(., '{unique_list_name}')]"))
     )
     _safe_click(our_list_option)
+    time.sleep(1.5)
     log_message("Lead list selected.")
     log_message("Campaign details configured.")
 
-    # Select Email channel under Available Channels (For AI campaign only)
     if campaign_type == "ai":
+        # AI campaigns: just toggle the Email channel on and leave the wait
+        # duration alone here — unlike Manual, the wait is set later during
+        # the Edit Sequence step (after trimming down to a single Email
+        # block), not at creation time.
         log_message("Selecting Email channel for AI Campaign...")
         email_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, campaign_selectors.EMAIL_CHANNEL_SELECTOR))
         )
         _safe_click(email_btn)
-        log_message("Email channel selected.")
+        time.sleep(1.5)
+        log_message("Email channel toggle enabled.")
+    else:
+        log_message("Configuring Channel Sequence for Manual Campaign...")
+        try:
+            open_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Open Channel Sequence')]"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", open_btn)
+            _safe_click(open_btn)
+            time.sleep(2)
 
-    # Complete all remaining configuration steps: conversion criteria
+            channel_dd = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.presence_of_element_located((By.XPATH, "//select[option[@value='Email']] | //select[contains(., 'Email')]"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", channel_dd)
+            time.sleep(1)
+            Select(channel_dd).select_by_value("Email")
+            time.sleep(1.5)
+
+            set_campaign_waits_to_one_minute(driver)
+            time.sleep(1)
+
+            log_message("Manual Channel Sequence configured with Email.")
+        except Exception as e:
+            log_message(f"Warning: Failed to configure manual channel sequence: {clean_exception(e)}")
+
     for criteria in conversion_criteria:
         try:
             checkbox_xpath = (
@@ -1177,21 +751,67 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
             if not checkbox.is_selected():
                 _safe_click(checkbox)
+                time.sleep(0.8)
         except Exception:
             pass
 
-    # Preview Mode toggle if preview_mode is enabled
-    if preview_mode:
-        log_message("Enabling Preview Mode...")
-        PREVIEW_MODE_TOGGLE_SELECTOR = "/html/body/div[3]/div[2]/main/div[2]/div/section[8]/div/div[2]/button"
+    time.sleep(1)
+
+    # --------------------------------------------------------------
+    # Preview Mode toggle — ALWAYS enabled now.
+    #
+    # FIX: This used to rely SOLELY on a hardcoded absolute XPath
+    # (section[8]) that was calibrated against the Manual creation form's
+    # DOM. The AI creation form does not render the "Channel Sequence"
+    # section that Manual has, so the section index shifts and
+    # section[8] no longer points at the Preview Mode toggle for AI
+    # campaigns — it either times out or grabs the wrong button, which
+    # then throws off the rest of the flow (including the later
+    # Run Campaign click).
+    #
+    # Now we try a semantic, text-based locator first (finds the toggle
+    # by the "Preview" label itself, so it's immune to section reordering
+    # between Manual/AI), and only fall back to the absolute XPath if
+    # that fails. We also check the toggle's current state so we don't
+    # blindly click it OFF if it's already ON.
+    # --------------------------------------------------------------
+    log_message("Enabling Preview Mode...")
+    PREVIEW_MODE_TOGGLE_SELECTOR = "/html/body/div[3]/div[2]/main/div[2]/div/section[8]/div/div[2]/button"
+    preview_toggle_label_xpath = (
+        "//p[contains(translate(., 'PREVIEW', 'preview'), 'preview')]"
+        "/ancestor::div[contains(@class, 'flex')][1]//button"
+    )
+
+    try:
+        preview_toggle = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+            EC.presence_of_element_located((By.XPATH, preview_toggle_label_xpath))
+        )
+        log_message("Preview Mode toggle located via text label.")
+    except Exception:
+        log_message("Preview Mode text-label locator failed — falling back to absolute XPath.")
         preview_toggle = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.presence_of_element_located((By.XPATH, PREVIEW_MODE_TOGGLE_SELECTOR))
         )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", preview_toggle)
-        _safe_click(preview_toggle)
-        log_message("Preview Mode enabled.")
 
-    # Click the Run Campaign button
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", preview_toggle)
+    time.sleep(1)
+
+    toggle_state_attr = preview_toggle.get_attribute("aria-checked")
+    toggle_class = (preview_toggle.get_attribute("class") or "").lower()
+    is_on = (
+        toggle_state_attr == "true"
+        or "bg-violet" in toggle_class
+        or "active" in toggle_class
+        or "on" in toggle_class
+    )
+
+    if is_on:
+        log_message("Preview Mode toggle already ON.")
+    else:
+        _safe_click(preview_toggle)
+        time.sleep(2)
+        log_message("Preview Mode toggle enabled.")
+
     if campaign_type == "ai":
         run_btn_xpath = campaign_selectors.RUN_CAMPAIGN_BUTTON_SELECTOR
     else:
@@ -1201,81 +821,217 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
         EC.presence_of_element_located((By.XPATH, run_btn_xpath))
     )
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", run_btn)
+    time.sleep(1)
     if run_btn.get_attribute("disabled") is not None:
         driver.execute_script("arguments[0].removeAttribute('disabled');", run_btn)
+    time.sleep(0.5)
     _safe_click(run_btn)
+    time.sleep(2)
     log_message("Run Campaign button clicked.")
-    
+
     return smtp_screenshot_path, run_timestamp
 
 
 def run_test_case(provider, campaign_type):
     """Executes a single test case for a combination of provider and campaign_type.
-    Returns (status, error_message, duration, screenshot_path, smtp_screenshot_path).
+    After creation (Preview Mode always on), this opens the campaign via the
+    pencil 'Edit campaign' icon and verifies the Preview Mode toggle is ON
+    before activating. After activation, once the Campaign Activities
+    overview loads, it cycles between the Lead Activity and Email views
+    (waiting 1 minute in each, then going back to Campaign Activities) TWICE.
+    The email evidence screenshot is captured on the Email view of the
+    final (2nd) cycle. There is no separate preview-email-send/OCR check
+    and no separate bug-check campaign.
+
+    Every meaningful checkpoint is recorded via record_step() so the report
+    can render a full numbered pipeline for this combination. If anything
+    raises, the FAIL is attributed to whichever step was in progress
+    (tracked via `current_step_title`) and no further steps are recorded
+    for this combination.
+
+    Returns (status, error_message, duration, screenshot_path, smtp_screenshot_path,
+    email_activity_screenshot).
     """
     start_time = time.time()
     screenshot_path = ""
     smtp_screenshot_path = ""
+    email_activity_screenshot = ""
     error_msg = ""
     status = "FAIL"
-    
-    # Define a unique campaign name for this run to avoid conflicts
+
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_campaign_name = f"{campaign_type.title()}_Campaign_{provider}_{run_timestamp}"
-    
+    combo_label = f"{provider.upper()}-{campaign_type.upper()}"
+
+    # Selectors for the Campaign Activities overview cards / nav
+    #
+    # IMPORTANT: these require BOTH the exact card title AND its subtitle,
+    # not just a loose `contains(text(), 'Email')`. The sidebar nav item
+    # "Quote Automation" has a child <p> reading "Email quote & sample
+    # workflows" — that also satisfies a bare `contains(text(),'Email')`
+    # check and, being earlier in the DOM, was winning the match, so the
+    # old XPath was clicking into Quote Automation instead of the real
+    # "Email" activity card. Anchoring on both <p> lines (title + subtitle)
+    # makes the match unique to the actual card shown on Campaign Activities.
+    BACK_TO_CAMPAIGN_ACTIVITIES_XPATH = "//button[contains(., 'Back to Campaign Activities')]"
+    LEAD_ACTIVITY_CARD_XPATH = (
+        "//button[.//p[normalize-space(text())='Lead Activity']"
+        " and .//p[contains(text(), 'Overview of all activities across this campaign')]]"
+    )
+    EMAIL_CARD_XPATH = (
+        "//button[.//p[normalize-space(text())='Email']"
+        " and .//p[contains(text(), 'Email open rates, clicks, and responses')]]"
+    )
+
+    current_step_title = f"Configure SMTP & Create Campaign [{combo_label}]"
+
     try:
         log_message(f"Executing: Provider={provider}, CampaignType={campaign_type}")
-        
+
         smtp_screenshot_path, run_timestamp = create_campaign_steps(
-            driver, provider, campaign_type, unique_campaign_name, unique_list_name, preview_mode=False
+            driver, provider, campaign_type, unique_campaign_name, unique_list_name
+        )
+        record_step(
+            current_step_title,
+            f"SMTP provider set to '{provider}'; campaign '{unique_campaign_name}' created "
+            f"and Run Campaign clicked."
         )
 
-        # Wait until the campaign is successfully created and the page finishes loading
+        # --------------------------------------
+        # EDIT CAMPAIGN -> VERIFY PREVIEW MODE TOGGLE IS ON
+        # --------------------------------------
+        current_step_title = f"Verify Preview Mode [{combo_label}]"
+        log_message("Opening campaign via Edit (pencil) icon to verify Preview Mode toggle...")
+        driver.get(TARGET_URL.rstrip('/') + "/campaign")
+        time.sleep(3)
+
+        campaign_card_xpath = f"//*[contains(normalize-space(.), '{unique_campaign_name}')]"
+        campaign_card = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+            EC.presence_of_element_located((By.XPATH, campaign_card_xpath))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", campaign_card)
+        time.sleep(1)
+
+        card_wrapper_xpath = (
+            f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
+            f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
+        )
+        edit_pencil_xpath = card_wrapper_xpath + "//button[@title='Edit campaign']"
+
+        edit_pencil_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+            EC.element_to_be_clickable((By.XPATH, edit_pencil_xpath))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", edit_pencil_btn)
+        time.sleep(1)
+        _safe_click(edit_pencil_btn)
+        time.sleep(2)
+        log_message("Edit campaign view opened.")
+
+        # PREVIEW MODE TOGGLE inside the Edit view
+        # VERIFY: confirm this selector matches the Edit-campaign view DOM
+        PREVIEW_MODE_TOGGLE_EDIT_SELECTOR = "/html/body/div[3]/div[2]/main/div[2]/div/section[8]/div/div[2]/button"
+        preview_toggle_label_xpath = (
+            "//p[contains(translate(., 'PREVIEW', 'preview'), 'preview')]"
+            "/ancestor::div[contains(@class, 'flex')][1]//button"
+        )
+
+        try:
+            preview_toggle = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.presence_of_element_located((By.XPATH, preview_toggle_label_xpath))
+            )
+        except Exception:
+            preview_toggle = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.presence_of_element_located((By.XPATH, PREVIEW_MODE_TOGGLE_EDIT_SELECTOR))
+            )
+
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", preview_toggle)
+        time.sleep(1)
+
+        # VERIFY: state check via aria-checked, falling back to class heuristics
+        toggle_state_attr = preview_toggle.get_attribute("aria-checked")
+        toggle_class = (preview_toggle.get_attribute("class") or "").lower()
+        is_on = (
+            toggle_state_attr == "true"
+            or "bg-violet" in toggle_class
+            or "active" in toggle_class
+            or "on" in toggle_class
+        )
+
+        if is_on:
+            log_message("Preview Mode toggle verified ON.")
+            preview_note = "Preview Mode toggle verified ON."
+        else:
+            log_message("Preview Mode toggle appears OFF — enabling it now.")
+            _safe_click(preview_toggle)
+            time.sleep(1.5)
+            log_message("Preview Mode toggle enabled.")
+            preview_note = "Preview Mode toggle was OFF; enabled it now."
+
+        # Dedicated regression checks, reported separately from the normal
+        # pipeline steps. These use this campaign's open edit form rather
+        # than creating extra test campaigns.
+        verify_advance_toggle_persistence(driver, campaign_type, combo_label)
+        if campaign_type == "manual":
+            verify_wait_duration(driver, campaign_type, combo_label)
+
+        try:
+            save_or_close_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//button[contains(., 'Save') or contains(., 'Close') or contains(., 'Done')]")
+                )
+            )
+            _safe_click(save_or_close_btn)
+            time.sleep(2)
+            log_message("Edit campaign view closed.")
+        except Exception:
+            driver.get(TARGET_URL.rstrip('/') + "/campaign")
+            time.sleep(3)
+
+        record_step(current_step_title, preview_note)
+
+        # --------------------------------------
+        # AI-specific sequence editing
+        # --------------------------------------
         if campaign_type == "ai":
+            current_step_title = f"Edit AI Sequence [{combo_label}]"
             log_message("AI Campaign: Navigating to campaigns list to modify sequence...")
             driver.get(TARGET_URL.rstrip('/') + "/campaign")
             time.sleep(3)
-            
-            # Click on View Leads for the target campaign card
-            view_leads_xpath = (
-                f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
-                f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
-                f"//button[contains(., 'View Leads')]"
-            )
+
+            view_leads_xpath = card_wrapper_xpath + "//button[contains(., 'View Leads')]"
             view_leads_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
                 EC.element_to_be_clickable((By.XPATH, view_leads_xpath))
             )
             _safe_click(view_leads_btn)
             time.sleep(2)
-            
-            # Click Edit Sequence
+
             edit_seq_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Edit Sequence')]"))
             )
             _safe_click(edit_seq_btn)
             time.sleep(2)
-            
-            # Deletion loop for follow-up emails
+
             log_message("AI Campaign: Removing follow-up emails from sequence...")
+            removed_count = 0
             while True:
-                # Find any enabled delete button inside sequence panel
                 trash_buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'text-red-400') and not(@disabled)]")
                 if not trash_buttons:
                     log_message("AI Campaign: No more follow-up email blocks found.")
                     break
-                
+
                 log_message(f"AI Campaign: Deleting a follow-up email block (total remaining buttons: {len(trash_buttons)})")
                 _safe_click(trash_buttons[0])
-                time.sleep(2)  # Wait for the UI to refresh
-                
-            # Click Save inside sequence editor drawer
+                removed_count += 1
+                time.sleep(2)
+
+            set_campaign_waits_to_one_minute(driver)
+            verify_wait_duration(driver, campaign_type, combo_label)
             save_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[contains(@class, 'bg-blue-500') and (contains(., 'Save') or contains(text(), 'Save'))] | //button[contains(., 'Save')]"))
             )
             _safe_click(save_btn)
             time.sleep(2)
-            
-            # Return to previous screen
+
             try:
                 back_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
                     EC.element_to_be_clickable((By.XPATH, "//button[contains(@class, 'text-gray-500')]"))
@@ -1285,24 +1041,23 @@ def run_test_case(provider, campaign_type):
             except Exception:
                 driver.get(TARGET_URL.rstrip('/') + "/campaign")
                 time.sleep(3)
-            
-            # Activate button targets specific campaign card
-            activate_xpath = (
-                f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
-                f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
-                f"//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'activate')"
-                f" or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'start campaign')"
-                f" or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'publish')"
-                f" or contains(., 'Activate')]"
+
+            record_step(
+                current_step_title,
+                f"Removed {removed_count} follow-up email block(s); waits set to 00:01 and saved."
             )
-        else:
-            # Activate manual campaign
-            activate_xpath = (
-                "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'activate')]"
-                " | //button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'start campaign')]"
-                " | //button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'publish')]"
-                " | //button[contains(., 'Activate')]"
-            )
+
+        # --------------------------------------
+        # Activate the campaign
+        # --------------------------------------
+        current_step_title = f"Activate Campaign [{combo_label}]"
+        activate_xpath = (
+            card_wrapper_xpath +
+            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'activate')"
+            " or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'start campaign')"
+            " or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'publish')"
+            " or contains(., 'Activate')]"
+        )
 
         activate_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, activate_xpath))
@@ -1310,15 +1065,18 @@ def run_test_case(provider, campaign_type):
         _safe_click(activate_btn)
         log_message("Campaign activated.")
         time.sleep(2)
-        
-        # 3. Campaign Completion
+        record_step(current_step_title, "Campaign activated successfully.")
+
+        # --------------------------------------
+        # Wait for campaign completion
+        # --------------------------------------
+        current_step_title = f"Wait for Completion [{combo_label}]"
         log_message("Waiting for campaign to complete...")
         completed_xpath = (
-            f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
-            f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
-            f"//*[contains(translate(normalize-space(.), 'COMPLETED', 'completed'), 'completed')]"
+            card_wrapper_xpath +
+            "//*[contains(translate(normalize-space(.), 'COMPLETED', 'completed'), 'completed')]"
         )
-        
+
         status_found = False
         for attempt in range(5):
             try:
@@ -1333,199 +1091,107 @@ def run_test_case(provider, campaign_type):
                 log_message(f"Waiting... Attempt {attempt+1}/5.")
                 driver.refresh()
                 time.sleep(2)
-                
+
         if not status_found:
             raise TimeoutError("Campaign status did not show 'Completed' within 90 seconds.")
-            
-        view_details_xpath = (
-            f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
-            f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
-            f"//button[contains(., 'View Details')]"
-        )
+
+        record_step(current_step_title, "Campaign status showed 'Completed'.")
+
+        view_details_xpath = card_wrapper_xpath + "//button[contains(., 'View Details')]"
         view_details_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, view_details_xpath))
         )
         _safe_click(view_details_btn)
         time.sleep(3)
-        
-        activity_btn_xpath = (
-            "//p[contains(text(), 'Overview of all activities across this campaign')]"
-            " | //*[contains(text(), 'Overview of all activities across this campaign')]/ancestor::button"
+        log_message("Campaign Activities overview opened.")
+
+        # --------------------------------------
+        # LEAD ACTIVITY <-> EMAIL CYCLE (x2)
+        # Pattern each cycle: Lead Activity -> wait 1 min -> Back ->
+        #                     Email -> wait 1 min -> Back
+        # The email evidence screenshot is captured during the LAST Email
+        # visit (2nd cycle), right before going back, since that's the
+        # freshest view of the Sent/Bounced/Skipped/Failed/Engaged metrics.
+        # --------------------------------------
+        current_step_title = f"Lead Activity / Email Cycle [{combo_label}]"
+        TOTAL_CYCLES = 2
+        for cycle_num in range(1, TOTAL_CYCLES + 1):
+            log_message(f"--- Lead Activity / Email cycle {cycle_num}/{TOTAL_CYCLES} ---")
+
+            # 1. Click Lead Activity
+            lead_activity_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, LEAD_ACTIVITY_CARD_XPATH))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", lead_activity_btn)
+            _safe_click(lead_activity_btn)
+            time.sleep(2)
+            log_message("Lead Activity opened. Waiting 1 minute...")
+            time.sleep(10)
+
+            # 2. Back to Campaign Activities
+            back_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, BACK_TO_CAMPAIGN_ACTIVITIES_XPATH))
+            )
+            _safe_click(back_btn)
+            time.sleep(2)
+            log_message("Back to Campaign Activities.")
+
+            # 3. Click Email
+            email_card_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, EMAIL_CARD_XPATH))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", email_card_btn)
+            _safe_click(email_card_btn)
+            time.sleep(2)
+            log_message("Email view opened. Waiting 1 minute...")
+            time.sleep(10)
+
+            # Capture the email evidence screenshot on the final cycle's
+            # Email visit, right before navigating back. This is the ONLY
+            # screenshot OCR is run against (see utils/vision_analyser.py).
+            if cycle_num == TOTAL_CYCLES:
+                email_activity_screenshot = email_screenshot_path(RUN_DIR, provider, campaign_type, run_timestamp)
+                try:
+                    driver.save_screenshot(email_activity_screenshot)
+                    log_message("Captured email activity metrics screenshot for OCR evidence.")
+                except Exception:
+                    email_activity_screenshot = ""
+
+            # 4. Back to Campaign Activities
+            back_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, BACK_TO_CAMPAIGN_ACTIVITIES_XPATH))
+            )
+            _safe_click(back_btn)
+            time.sleep(2)
+            log_message("Back to Campaign Activities.")
+
+        record_step(
+            current_step_title,
+            f"Completed {TOTAL_CYCLES} Lead Activity/Email cycles; email evidence "
+            f"{'captured' if email_activity_screenshot else 'NOT captured'}."
         )
-        activity_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.element_to_be_clickable((By.XPATH, activity_btn_xpath))
-        )
-        _safe_click(activity_btn)
-        time.sleep(4)
-        
-        completed_span_xpath = "//span[contains(@class, 'bg-green-50') and contains(text(), 'Completed')] | //span[contains(text(), 'Completed')]"
-        lead_completed = False
-        for attempt in range(1, 6):
-            completed_spans = driver.find_elements(By.XPATH, completed_span_xpath)
-            if completed_spans:
-                lead_completed = True
-                log_message("Lead completion verified.")
-                break
-            time.sleep(15)
-            driver.refresh()
-            time.sleep(3)
-            try:
-                activity_btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, activity_btn_xpath))
-                )
-                _safe_click(activity_btn)
-                time.sleep(2)
-            except Exception:
-                pass
-                
-        if not lead_completed:
-            raise TimeoutError("Timed out waiting for lead status to become 'Completed'.")
-            
+
         status = "PASS"
-        screenshot_path = os.path.join(RUN_SCREENSHOT_DIR, f"SUCCESS_{provider}_{campaign_type}_{run_timestamp}.png")
+        current_step_title = f"Capture Success Screenshot [{combo_label}]"
+        screenshot_path = success_screenshot_path(RUN_DIR, provider, campaign_type, run_timestamp)
         driver.save_screenshot(screenshot_path)
+        record_step(current_step_title, "Combination completed successfully.")
         log_message(f"Result: SUCCESS for Provider={provider}, CampaignType={campaign_type}")
-        
+
     except Exception as exc:
         status = "FAIL"
         error_msg = clean_exception(exc)
+        record_step(current_step_title, error_msg, status="FAIL")
         log_message(f"Result: FAIL for Provider={provider}, CampaignType={campaign_type}. Error: {error_msg}")
-        screenshot_path = os.path.join(RUN_SCREENSHOT_DIR, f"ERROR_{provider}_{campaign_type}_{run_timestamp}.png")
+        screenshot_path = build_error_screenshot_path(RUN_DIR, f"{provider}_{campaign_type}", run_timestamp)
         try:
             driver.save_screenshot(screenshot_path)
         except Exception:
             pass
-            
-    duration = round(time.time() - start_time, 2)
-    return status, error_msg, duration, screenshot_path, smtp_screenshot_path
 
-
-def run_bug_1_test_case(provider, campaign_type):
-    """Executes validation for Preview Mode email send on a given provider and campaign type."""
-    global ocr_reader
-    start_time = time.time()
-    screenshot_path = ""
-    error_msg = ""
-    status = "FAIL"
-    
-    # Lazily initialize EasyOCR reader to save start-up time if not needed
-    if ocr_reader is None:
-        log_message("Initializing EasyOCR English Reader...")
-        ocr_reader = easyocr.Reader(['en'])
-        log_message("EasyOCR Reader successfully initialized.")
-        
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique_campaign_name = f"{campaign_type.title()}_Bug1_{provider}_{run_timestamp}"
-    
-    try:
-        # Reset browser state
-        reset_browser_state()
-        
-        # Configure SMTP & create campaign with preview_mode=True
-        log_message(f"Bug 1: Creating campaign with Preview Mode for Provider={provider}, CampaignType={campaign_type}")
-        smtp_screenshot, create_ts = create_campaign_steps(
-            driver=driver,
-            provider=provider,
-            campaign_type=campaign_type,
-            unique_campaign_name=unique_campaign_name,
-            unique_list_name=unique_list_name,
-            preview_mode=True
-        )
-        
-        # Wait for redirect to campaign page and card visibility
-        log_message("Waiting for campaign to be created successfully...")
-        WebDriverWait(driver, 30).until(
-            EC.url_contains("/campaign")
-        )
-        campaign_card_xpath = f"//*[contains(normalize-space(.), '{unique_campaign_name}')]"
-        campaign_card = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.presence_of_element_located((By.XPATH, campaign_card_xpath))
-        )
-        
-        if "/campaign" not in driver.current_url:
-            log_message("Returning to Campaign Listing page...")
-            driver.get(TARGET_URL.rstrip('/') + "/campaign")
-            time.sleep(2)
-            
-        campaign_card = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.presence_of_element_located((By.XPATH, campaign_card_xpath))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", campaign_card)
-        time.sleep(1)
-        
-        PREVIEW_ICON_SELECTOR = "/html/body/div[3]/div[2]/main/div/div[4]/div[2]/div/div[4]/div[2]/button[2]"
-        PREVIEW_LEAD_LIST_SELECTOR = "/html/body/div[3]/div[2]/main/div[3]/div[2]/table/tbody/tr/td[1]/input"
-        SEND_PREVIEW_EMAIL_BUTTON_SELECTOR = "/html/body/div[3]/div[2]/main/div[1]/button[2]"
-        NOTIFICATION_TOAST_SELECTOR = "/html/body/div[4]/div/div"
-        
-        try:
-            preview_btn = campaign_card.find_element(By.XPATH, ".//button[contains(@title, 'Preview') or contains(., 'Preview') or contains(@class, 'preview')]")
-        except Exception:
-            preview_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-                EC.element_to_be_clickable((By.XPATH, PREVIEW_ICON_SELECTOR))
-            )
-            
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", preview_btn)
-        _safe_click(preview_btn)
-        log_message("Preview dialog opened.")
-        
-        lead_list_input = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.element_to_be_clickable((By.XPATH, PREVIEW_LEAD_LIST_SELECTOR))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", lead_list_input)
-        if not lead_list_input.is_selected():
-            _safe_click(lead_list_input)
-        log_message("Lead List selected.")
-        
-        send_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.element_to_be_clickable((By.XPATH, SEND_PREVIEW_EMAIL_BUTTON_SELECTOR))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", send_btn)
-        _safe_click(send_btn)
-        log_message("Preview email sent.")
-        
-        toast_elem = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.visibility_of_element_located((By.XPATH, NOTIFICATION_TOAST_SELECTOR))
-        )
-        log_message("Notification detected.")
-        
-        screenshot_filename = f"Bug1_{provider}_{campaign_type}_Toast_{run_timestamp}.png"
-        screenshot_path = os.path.join(RUN_DIR, screenshot_filename)
-        toast_elem.screenshot(screenshot_path)
-        log_message(f"Screenshot of toast captured: {screenshot_path}")
-        
-        ocr_results = ocr_reader.readtext(screenshot_path)
-        extracted_text = " ".join([res[1] for res in ocr_results]).strip()
-        confidence = sum([res[2] for res in ocr_results]) / len(ocr_results) if ocr_results else 0.0
-        log_message(f"Raw OCR Output: '{extracted_text}' (Confidence: {confidence:.2f})")
-        
-        if not extracted_text or confidence < 0.30:
-            raise AssertionError(f"OCR could not confidently read the toast message. Extracted: '{extracted_text}'.")
-            
-        lower_text = extracted_text.lower()
-        if "success" in lower_text or "sent" in lower_text or "successfully" in lower_text:
-            status = "PASS"
-        elif "fail" in lower_text or "failed" in lower_text or "error" in lower_text:
-            status = "FAIL"
-            error_msg = f"Application returned fail status: {extracted_text}"
-        else:
-            status = "PASS"
-            log_message(f"Notice: Other status returned: {extracted_text}")
-            
-        log_message(f"Result: {status} for Bug 1 Provider={provider}, CampaignType={campaign_type}")
-        
-    except Exception as e:
-        status = "FAIL"
-        error_msg = clean_exception(e)
-        log_message(f"Result: FAIL for Bug 1 Provider={provider}, CampaignType={campaign_type}. Error: {error_msg}")
-        screenshot_path = os.path.join(RUN_DIR, f"ERROR_Bug1_{provider}_{campaign_type}_{run_timestamp}.png")
-        try:
-            driver.save_screenshot(screenshot_path)
-        except Exception:
-            pass
-            
     duration = round(time.time() - start_time, 2)
-    return status, error_msg, duration, screenshot_path
+    return status, error_msg, duration, screenshot_path, smtp_screenshot_path, email_activity_screenshot
+
 
 # ==========================================
 if __name__ == '__main__':
@@ -1538,84 +1204,81 @@ if __name__ == '__main__':
         current_test_name = "Test 1 (Authentication)"
         current_test_start = time.time()
         log_message("--- Test 1: Authentication ---")
-    
-        # Step 1.1: Launch Application URL
+
         driver.get(TARGET_URL)
-        time.sleep(2) # Brief explicit delay for page assets to stabilize
-    
-        # Step 1.2 & 1.3: Populate credentials and submit the form
+        time.sleep(2)
+
         email_field = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.visibility_of_element_located((By.NAME, "email"))
         )
+        record_step("Open App", f"Loaded: {driver.current_url}")
+
         email_field.send_keys(USER_ID)
         driver.find_element(By.NAME, "password").send_keys(PASSWORD)
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
-    
-        # Step 1.4: Validate Dashboard access by finding a key home page element
+
         dashboard_element = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Super Admin') or contains(text(), 'Enterprise AI Platform')]"))
         )
 
-        # Dismiss any post-login popup before moving on
         dismiss_post_login_popup(driver)
-    
-        # Capture success evidence screenshot for Test 1
-        screenshot_1_path = os.path.join(RUN_SCREENSHOT_DIR, "01_Login_Success.png")
+        record_step("Login", f"Authenticated as {USER_ID}")
+
+        screenshot_1_path = misc_screenshot_path(RUN_DIR, "01_Login_Success.png")
         driver.save_screenshot(screenshot_1_path)
         duration = round(time.time() - current_test_start, 2)
         test_durations["Test 1 (Authentication)"] = duration
 
         log_message(f"Test 1 PASSED. Duration: {duration}s")
         test_results["Test 1 (Authentication)"] = f"PASSED ({duration}s)"
-    
-        # Create the shared lead list once for all test cases
+
         current_test_name = "Lead List Creation"
         current_test_start = time.time()
         create_shared_lead_list(driver, unique_list_name)
+        record_step("Create Lead List", f"List '{unique_list_name}' created")
         list_duration = round(time.time() - current_test_start, 2)
         test_durations["Lead List Creation"] = list_duration
         test_results["Lead List Creation"] = f"PASSED ({list_duration}s)"
-    
+
         # --------------------------------------
         # ITERATIVE MULTI-PROVIDER / CAMPAIGN VALIDATION
         # --------------------------------------
-        providers = ["sendgrid", "mailgun", "outlook", "gmail", "smartlead"]
+        providers = ["mailgun", "outlook", "gmail", "smartlead"]
         campaign_types = ["manual", "ai"]
         combinations_results.clear()
-    
+
         for provider in providers:
             for campaign_type in campaign_types:
                 comb_name = f"{provider.upper()} - {campaign_type.upper()}"
                 log_message(f"\n=========================================")
                 log_message(f"STARTING TEST CASE: {comb_name}")
                 log_message(f"=========================================\n")
-            
+
                 status = "FAIL"
                 error_msg = ""
                 duration = 0.0
                 screenshot_path = ""
                 smtp_screenshot_path = ""
+                email_activity_screenshot = ""
                 start_time = time.time()
-            
+
                 try:
-                    # Reset state to clean before the run
                     reset_browser_state()
-                
-                    # Run combination
-                    status, error_msg, duration, screenshot_path, smtp_screenshot_path = run_test_case(provider, campaign_type)
+                    status, error_msg, duration, screenshot_path, smtp_screenshot_path, email_activity_screenshot = run_test_case(provider, campaign_type)
                 except Exception as e:
                     status = "FAIL"
                     error_msg = f"Unexpected failure in test orchestrator: {clean_exception(e)}"
                     duration = round(time.time() - start_time, 2)
+                    record_step(f"Test Orchestrator [{provider.upper()}-{campaign_type.upper()}]", error_msg, status="FAIL")
                     log_message(f"Result: FAIL for Provider={provider}, CampaignType={campaign_type}. Error: {error_msg}")
-                    # Save diagnostic screenshot
-                    screenshot_path = os.path.join(RUN_SCREENSHOT_DIR, f"ERROR_{provider}_{campaign_type}_{timestamp}.png")
+                    screenshot_path = build_error_screenshot_path(RUN_DIR, f"{provider}_{campaign_type}", timestamp)
                     try:
                         driver.save_screenshot(screenshot_path)
                     except Exception:
                         pass
                     smtp_screenshot_path = ""
-            
+                    email_activity_screenshot = ""
+
                 current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_message("--- TEST CASE METRICS ---")
                 log_message(f"Email Provider: {provider.upper()}")
@@ -1625,7 +1288,7 @@ if __name__ == '__main__':
                     log_message(f"Error Message: {error_msg}")
                 log_message(f"Timestamp: {current_timestamp}")
                 log_message("-------------------------")
-            
+
                 combinations_results.append({
                     "provider": provider,
                     "campaign_type": campaign_type,
@@ -1634,66 +1297,10 @@ if __name__ == '__main__':
                     "duration": duration,
                     "screenshot": screenshot_path,
                     "smtp_screenshot": smtp_screenshot_path,
+                    "email_activity_screenshot": email_activity_screenshot,
                     "timestamp": current_timestamp
                 })
-            
-                # Reset state again to clean after the run
-                try:
-                    reset_browser_state()
-                except Exception:
-                    pass
-                
-                # --------------------------------------
-                # RUN BUG 1 TEST CASE FOR THIS COMBINATION
-                # --------------------------------------
-                bug_comb_name = f"BUG 1 ({provider.upper()} - {campaign_type.upper()})"
-                log_message(f"\n=========================================")
-                log_message(f"STARTING TEST CASE: {bug_comb_name}")
-                log_message(f"=========================================\n")
-                
-                bug_status = "FAIL"
-                bug_error = ""
-                bug_duration = 0.0
-                bug_screenshot = ""
-                bug_start_time = time.time()
-                
-                try:
-                    # Run Bug 1 combination
-                    bug_status, bug_error, bug_duration, bug_screenshot = run_bug_1_test_case(provider, campaign_type)
-                except Exception as e:
-                    bug_status = "FAIL"
-                    bug_error = f"Unexpected failure in Bug 1 test: {clean_exception(e)}"
-                    bug_duration = round(time.time() - bug_start_time, 2)
-                    log_message(f"Result: FAIL for Bug 1 Provider={provider}, CampaignType={campaign_type}. Error: {bug_error}")
-                    bug_screenshot = os.path.join(RUN_SCREENSHOT_DIR, f"ERROR_Bug1_{provider}_{campaign_type}_{timestamp}.png")
-                    try:
-                        driver.save_screenshot(bug_screenshot)
-                    except Exception:
-                        pass
-                
-                bug_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_message("--- BUG 1 TEST CASE METRICS ---")
-                log_message(f"Email Provider: {provider.upper()}")
-                log_message(f"Campaign Type: {campaign_type.upper()}")
-                log_message(f"Status: {bug_status}")
-                if bug_status == "FAIL" or bug_error:
-                    log_message(f"Error Message: {bug_error}")
-                log_message(f"Timestamp: {bug_timestamp}")
-                log_message("-------------------------")
-                
-                combinations_results.append({
-                    "provider": provider,
-                    "campaign_type": campaign_type,
-                    "bug_test": True,
-                    "status": bug_status,
-                    "error_message": bug_error,
-                    "duration": bug_duration,
-                    "screenshot": bug_screenshot,
-                    "smtp_screenshot": "",
-                    "timestamp": bug_timestamp
-                })
-                
-                # Reset state again to clean after the run
+
                 try:
                     reset_browser_state()
                 except Exception:
@@ -1702,7 +1309,6 @@ if __name__ == '__main__':
         # --------------------------------------
         # PROCESS RESULTS AND PREPARE SUMMARY
         # --------------------------------------
-        # Reinitialize global summary outputs
         test_results = {
             "Test 1 (Authentication)": f"PASSED ({test_durations['Test 1 (Authentication)']}s)",
             "Lead List Creation": f"PASSED ({test_durations['Lead List Creation']}s)"
@@ -1711,23 +1317,19 @@ if __name__ == '__main__':
             "Test 1 (Authentication)": test_durations["Test 1 (Authentication)"],
             "Lead List Creation": test_durations["Lead List Creation"]
         }
-    
+
         for r in combinations_results:
-            if r.get("bug_test"):
-                comb_key = f"Bug 1 ({r['provider'].upper()} - {r['campaign_type'].upper()})"
-            else:
-                comb_key = f"{r['provider'].upper()} - {r['campaign_type'].upper()}"
+            comb_key = f"{r['provider'].upper()} - {r['campaign_type'].upper()}"
             test_results[comb_key] = f"{r['status']} ({r['duration']}s)"
             if r['error_message']:
                 test_results[comb_key] += f" - Error: {r['error_message']}"
             test_durations[comb_key] = r["duration"]
-        
-        # Populate the suite summary structure
+
         suite_summary["total_executed"] = len(combinations_results)
         suite_summary["passed_tests"] = sum(1 for r in combinations_results if r["status"] == "PASS")
         suite_summary["failed_tests"] = sum(1 for r in combinations_results if r["status"] == "FAIL")
         suite_summary["failure_reasons"] = {
-            f"Bug 1 ({r['provider'].upper()} - {r['campaign_type'].upper()})" if r.get("bug_test") else f"{r['provider'].upper()} - {r['campaign_type'].upper()}": r["error_message"]
+            f"{r['provider'].upper()} - {r['campaign_type'].upper()}": r["error_message"]
             for r in combinations_results if r["status"] == "FAIL"
         }
 
@@ -1735,6 +1337,8 @@ if __name__ == '__main__':
     # 3. UMBRELLA ERROR HANDLING & RECOVERY
     # ==========================================
     except Exception as e:
+        import traceback
+
         critical_failure_occurred = True
         critical_error_message = clean_exception(e)
         critical_error_traceback = traceback.format_exc()
@@ -1743,32 +1347,30 @@ if __name__ == '__main__':
         log_message("           CRITICAL ERROR ENCOUNTERED           ")
         log_message("!"*50)
         log_message(f"Error Details: {critical_error_message}")
-    
-        # Record duration of currently running test upon error
+
         if current_test_name not in test_durations or test_durations[current_test_name] == 0.0:
             test_durations[current_test_name] = round(time.time() - current_test_start, 2)
-    
-        import traceback
+
+        record_step(current_test_name, critical_error_message, status="FAIL")
+
         cleaned_tb = clean_traceback(critical_error_traceback)
         log_message("Python Traceback:")
         for line in cleaned_tb.splitlines():
             log_message(f"  {line}")
         log_message("!"*50 + "\n")
-    
+
         test_results[current_test_name] = f"FAILED - Error: {critical_error_message}"
         error_step = current_test_name.replace(" ", "_").replace("(", "").replace(")", "")
-    
-        # Update suite summary to reflect critical failure details
+
         suite_summary["total_executed"] = len(test_results)
         suite_summary["passed_tests"] = sum(1 for status in test_results.values() if "PASS" in status.upper())
         suite_summary["failed_tests"] = sum(1 for status in test_results.values() if "FAIL" in status.upper())
         suite_summary["failure_reasons"][current_test_name] = critical_error_message
-        
-        # Take an immediate diagnostic error screenshot to see exactly what went wrong
-        error_screenshot_path = os.path.join(RUN_SCREENSHOT_DIR, f"ERROR_{error_step}.png")
+
+        critical_screenshot_path = build_error_screenshot_path(RUN_DIR, error_step, timestamp)
         try:
-            driver.save_screenshot(error_screenshot_path)
-            log_message(f"Diagnostic error screenshot preserved under: {error_screenshot_path}")
+            driver.save_screenshot(critical_screenshot_path)
+            log_message(f"Diagnostic error screenshot preserved under: {critical_screenshot_path}")
         except Exception as screenshot_err:
             log_message(f"Could not save diagnostic error screenshot (browser session may be invalid/closed): {screenshot_err}")
 
@@ -1776,7 +1378,6 @@ if __name__ == '__main__':
     # 4. TEARDOWN & REPORTS GENERATION
     # ==========================================
     finally:
-        # Clean up the shared lead list at the very end of the execution run (on success or failure)
         try:
             if 'unique_list_name' in locals() and unique_list_name and driver:
                 log_message("Finally: Resetting browser session to clean up shared lead list...")
@@ -1793,8 +1394,7 @@ if __name__ == '__main__':
             driver.quit()
         except Exception:
             pass
-    
-        # Print out and save the final structured summary report
+
         log_message("\n" + "="*45)
         log_message("         TEST SUITE SUMMARY REPORT          ")
         log_message("="*45)
@@ -1806,7 +1406,7 @@ if __name__ == '__main__':
             for test_name, reason in suite_summary["failure_reasons"].items():
                 log_message(f"  - {test_name}: {reason}")
         log_message("="*45 + "\n")
-    
+
         log_message("\n" + "="*45)
         log_message("        INDIVIDUAL TEST CASE RESULTS        ")
         log_message("="*45)
@@ -1814,8 +1414,22 @@ if __name__ == '__main__':
             log_message(f"{test_name}: {status}")
         log_message("="*45)
         log_message(f"Execution records are saved in '{RUN_DIR}/' folder.")
-    
-        # Generate the AI Executive Summary report
-        generate_ai_report()
-    
-        send_report_email()
+
+        try:
+            generate_email_campaign_report(
+                combinations_results=combinations_results,
+                suite_summary=suite_summary,
+                test_durations=test_durations,
+                test_results=test_results,
+                run_dir=RUN_DIR,
+                timestamp=timestamp,
+                test_num=test_num,
+                suite_start_time=suite_start_time,
+                critical_failure_occurred=critical_failure_occurred,
+                critical_error_message=critical_error_message,
+                env_vars=env_vars,
+                pipeline_steps=PIPELINE_STEPS,
+                bug_summary=BUG_SUMMARY,
+            )
+        except Exception as e:
+            log_message(f"Email campaign report generation failed: {clean_exception(e)}")
