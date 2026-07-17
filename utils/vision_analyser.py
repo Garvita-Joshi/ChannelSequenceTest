@@ -15,15 +15,25 @@ EMAIL_CARD_XPATH):
      ground truth per lead and can disagree with the summary cards on a
      one-lead test list.
 
-Why direct Tesseract instead of a Python OCR package:
-the Anaconda environment has a NumPy/Pandas binary mismatch. PaddleOCR and
-pytesseract both import that broken dependency chain before OCR can start.
-This module runs the installed `tesseract` executable directly and parses its
-TSV output using only Python's standard library. TSV gives each text token a
-bounding box, so we can still group tokens into visual rows and pair each
-metric label with the value in the same row.
+WHY DIRECT TESSERACT INSTEAD OF PaddleOCR OR pytesseract:
+PaddleOCR pulls in paddlex -> pandas -> pyarrow. That chain is currently
+broken on many machines running NumPy 2.x, because paddlex's dependencies
+(pandas/pyarrow builds) were compiled against NumPy 1.x — importing
+`from paddleocr import PaddleOCR` crashes with:
 
-Install once if needed: brew install tesseract
+    "A module that was compiled using NumPy 1.x cannot be run in
+     NumPy 2.2.6 as it may crash..."
+
+The `pytesseract` package also imports pandas in this Anaconda installation,
+so it fails before it can call Tesseract. This module therefore calls the
+installed `tesseract` executable directly and parses TSV using only the
+Python standard library.
+
+Install (system binary — REQUIRED):
+    macOS:    brew install tesseract
+    Ubuntu:   sudo apt-get install tesseract-ocr
+    Windows:  https://github.com/UB-Mannheim/tesseract/wiki
+              (then set pytesseract.pytesseract.tesseract_cmd to the .exe path)
 
 Scope note: this module intentionally only analyses the email activity
 screenshot. It is not used for any other screenshot type (SMTP config,
@@ -50,25 +60,25 @@ def _empty_verdict(combo_key, provider, campaign_type, image_path, reason):
 
 
 def read_ocr_tokens(image_path):
-    """Run the Tesseract CLI and return (text, confidence, box) tokens.
+    """Run Tesseract directly and return (text, confidence, box) tokens.
 
-    No Python OCR package is imported here. This makes the report independent
-    of PaddleX/PDX and of the broken NumPy/Pandas binary packages.
+    This deliberately does not import PIL, pytesseract, pandas, NumPy, or
+    PaddleOCR. It works in the current Anaconda environment despite its
+    binary NumPy/Pandas mismatch.
     """
     executable = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
     if not executable:
-        raise RuntimeError("Tesseract is not installed or not available on PATH.")
-
+        raise RuntimeError("Tesseract executable was not found on PATH.")
     psm = os.environ.get("TESSERACT_PSM", "11")
-    command = [executable, image_path, "stdout", "--oem", "3", "--psm", psm, "tsv"]
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or "unknown Tesseract error"
-        raise RuntimeError(detail)
+    result = subprocess.run(
+        [executable, image_path, "stdout", "--oem", "3", "--psm", psm, "tsv"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Tesseract command failed.")
 
     tokens = []
-    rows = csv.DictReader(completed.stdout.splitlines(), delimiter="\t")
-    for row in rows:
+    for row in csv.DictReader(result.stdout.splitlines(), delimiter="\t"):
         clean = (row.get("text") or "").strip()
         try:
             confidence = float(row.get("conf", "-1"))
@@ -86,7 +96,7 @@ def read_ocr_tokens(image_path):
 
 
 def _run_tesseract_ocr(image_path):
-    """Internal OCR entry point using the Tesseract executable."""
+    """Internal report OCR entry point."""
     return read_ocr_tokens(image_path)
 
 
@@ -202,7 +212,7 @@ def _extract_table_statuses(rows):
 
 def analyse_email_screenshot(image_path, provider, campaign_type):
     """
-    Runs Tesseract on the given email-activity screenshot and extracts:
+    Runs OCR on the given email-activity screenshot and extracts:
       - sent / bounced / skipped / failed / engaged counts (summary cards)
       - lead_table_statuses: one STATUS value per row of the per-lead table
       - table_status_counts: tally of lead_table_statuses, e.g. {"FAILED": 1}
@@ -218,12 +228,20 @@ def analyse_email_screenshot(image_path, provider, campaign_type):
     try:
         tokens = _run_tesseract_ocr(image_path)
     except Exception as e:
-        return _empty_verdict(combo_key, provider, campaign_type, image_path,
-                               f"Tesseract OCR failed with error: {e}")
+        type_name = type(e).__name__
+        if "not found on PATH" in str(e):
+            reason = (
+                "OCR failed: the 'tesseract' system binary isn't installed or isn't on PATH. "
+                "Install it with 'brew install tesseract' (macOS) or "
+                "'sudo apt-get install tesseract-ocr' (Ubuntu), then re-run."
+            )
+        else:
+            reason = f"OCR failed with error ({type_name}): {e}"
+        return _empty_verdict(combo_key, provider, campaign_type, image_path, reason)
 
     if not tokens:
         return _empty_verdict(combo_key, provider, campaign_type, image_path,
-                               "Tesseract OCR returned no text for this screenshot.")
+                               "OCR returned no text for this screenshot.")
 
     rows = _group_into_rows(tokens)
 
@@ -251,7 +269,7 @@ def analyse_email_screenshot(image_path, provider, campaign_type):
     raw_response = "\n".join(f"{t[0]} ({t[1]:.2f})" for t in tokens)
 
     reasoning = (
-        f"Tesseract OCR detected {sent} sent, {bounced} bounced, {skipped} skipped, "
+        f"OCR detected {sent} sent, {bounced} bounced, {skipped} skipped, "
         f"{failed} failed, {engaged} engaged from the summary cards (avg OCR confidence {avg_conf:.2f})."
     )
     if table_status_counts:

@@ -350,11 +350,9 @@ def _build_combo_rows_html(combinations_results: list, email_verdicts_by_combo: 
             f'<div style="margin-top:8px;font-size:11px;color:#dc2626;font-family:monospace;">{r["error_message"]}</div>'
             if r.get("error_message") else ""
         )
-        html += f"""
-      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px 18px;margin-bottom:12px;">
-        <div style="font-size:13px;font-weight:700;color:#334155;margin-bottom:8px;">{combo_key}</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">{pipeline_badge}{email_badge}</div>
-        {error_html}
+        has_email_evidence = bool(v.get("screenshot_used"))
+        if has_email_evidence:
+            evidence_html = f'''
         <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0;">
           <div style="background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:8px;text-align:center;">
             <div style="font-size:9px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Sent</div>
@@ -376,7 +374,18 @@ def _build_combo_rows_html(combinations_results: list, email_verdicts_by_combo: 
             <div style="font-size:9px;color:#94a3b8;text-transform:uppercase;font-weight:700;">Engaged</div>
             <div style="font-size:16px;font-weight:800;color:#16a34a;">{v.get('leads_engaged', 0)}</div>
           </div>
-        </div>
+        </div>'''
+        else:
+            evidence_html = f'''
+        <div style="margin:10px 0;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:10px 12px;font-size:12px;color:#92400e;line-height:1.5;">
+          <strong>Email metrics unavailable:</strong> no Email Activity screenshot was captured, so OCR was not run and the metrics are intentionally not shown.
+        </div>'''
+        html += f"""
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px 18px;margin-bottom:12px;">
+        <div style="font-size:13px;font-weight:700;color:#334155;margin-bottom:8px;">{combo_key}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">{pipeline_badge}{email_badge}</div>
+        {error_html}
+        {evidence_html}
         <div style="font-size:12px;color:#1e293b;line-height:1.6;background:#fff;border:1px solid #e2e8f0;
                     border-radius:6px;padding:8px 10px;">
           <strong>Reasoning:</strong> {v.get('reasoning', 'No evidence captured.')}
@@ -619,7 +628,10 @@ def _run_email_ocr(combinations_results: list) -> dict:
                 "combo": combo_key, "provider": r["provider"], "campaign_type": r["campaign_type"],
                 "sent": 0, "bounced": 0, "skipped": 0, "failed": 0, "leads_engaged": 0,
                 "emails_sent": "NO", "email_status": "Unknown", "evidence_confidence": "Low",
-                "reasoning": f"No email activity screenshot was captured for {combo_key}.",
+                "reasoning": (
+                    f"No email activity screenshot was captured for {combo_key}. "
+                    f"Pipeline error: {r.get('error_message') or 'not available'}."
+                ),
                 "screenshot_used": "", "raw_response": "", "source": "ocr_metrics",
             }
         verdicts_by_combo[combo_key] = verdict

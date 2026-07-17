@@ -85,13 +85,48 @@ def record_bug_check(label, mode, status, note):
 
 def _toggle_is_on(toggle):
     state = (toggle.get_attribute("aria-checked") or "").lower()
+    data_state = (toggle.get_attribute("data-state") or "").lower()
     classes = (toggle.get_attribute("class") or "").lower()
     thumb_classes = ""
     try:
         thumb_classes = (toggle.find_element(By.XPATH, ".//span").get_attribute("class") or "").lower()
     except Exception:
         pass
-    return state == "true" or "bg-blue-500" in classes or "bg-indigo-500" in classes or "translate-x-6" in thumb_classes
+    return (
+        state == "true" or "bg-blue-500" in classes or "bg-indigo-500" in classes
+        or data_state in ("true", "on", "checked") or "bg-violet" in classes
+        or "translate-x-6" in thumb_classes
+    )
+
+
+def verify_preview_toggle_persistence(driver, preview_toggle, campaign_type, combo_label):
+    """Ensure Preview Mode is ON and remains ON after a scroll re-render."""
+    label = "Preview Toggle Persist"
+    mode = campaign_type.upper()
+    preview_xpath = (
+        "//p[normalize-space()='Preview Mode']"
+        "/ancestor::div[contains(@class, 'justify-between') and contains(@class, 'rounded-xl')][1]"
+        "//button[@type='button']"
+    )
+    try:
+        if not _toggle_is_on(preview_toggle):
+            _safe_click(preview_toggle)
+            time.sleep(0.8)
+        if not _toggle_is_on(preview_toggle):
+            raise AssertionError("Preview Mode did not turn ON")
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.8)
+        try:
+            preview_toggle = driver.find_element(By.XPATH, preview_xpath)
+        except Exception:
+            pass
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", preview_toggle)
+        time.sleep(0.5)
+        if not _toggle_is_on(preview_toggle):
+            raise AssertionError("Preview Mode reset to OFF after scrolling")
+        record_bug_check(label, mode, "PASS", f"{combo_label}: Preview Mode is ON and persisted after scrolling.")
+    except Exception as exc:
+        record_bug_check(label, mode, "FAIL", f"{combo_label}: {clean_exception(exc)}")
 
 
 def verify_advance_toggle_persistence(driver, campaign_type, combo_label):
@@ -301,8 +336,26 @@ def _read_toast_text(screenshot_path):
     return extracted_text, avg_conf
 
 
+def _set_react_input_value(driver, input_element, value):
+    """Force a React-controlled input value and dispatch its change events."""
+    driver.execute_script(
+        """
+        const input = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        ).set;
+        setter.call(input, value);
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+        input.dispatchEvent(new Event('change', {bubbles: true}));
+        input.dispatchEvent(new Event('blur', {bubbles: true}));
+        """,
+        input_element, value,
+    )
+
+
 def set_campaign_waits_to_one_minute(driver):
-    """Set every visible campaign sequence wait control to 00:01."""
+    """Force every visible wait duration from its default (often 24h) to 00:01."""
     hour_inputs = driver.find_elements(
         By.XPATH,
         "//span[translate(normalize-space(.), 'HOURS', 'hours')='hours']"
@@ -320,13 +373,11 @@ def set_campaign_waits_to_one_minute(driver):
     changed = 0
     for input_element in hour_inputs:
         if input_element.is_displayed() and input_element.is_enabled():
-            input_element.clear()
-            input_element.send_keys("0")
+            _set_react_input_value(driver, input_element, "0")
             changed += 1
     for input_element in minute_inputs:
         if input_element.is_displayed() and input_element.is_enabled():
-            input_element.clear()
-            input_element.send_keys("1")
+            _set_react_input_value(driver, input_element, "1")
             changed += 1
 
     if changed:
@@ -603,8 +654,8 @@ def delete_shared_lead_list(driver, list_name):
 
 def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name, unique_list_name):
     """Executes campaign creation steps up to clicking Run Campaign.
-    Preview Mode is always enabled as part of every campaign creation now —
-    there is no separate 'bug check' campaign flow anymore. Also selects
+    Preview Mode and Advance Campaign Setting are both enabled for the
+    requested campaign configuration. Also selects
     'SMTP' from the Email Sender Platform dropdown (CRM / SMTP) before
     picking the actual SMTP provider.
     """
@@ -758,7 +809,7 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
     time.sleep(1)
 
     # --------------------------------------------------------------
-    # Preview Mode toggle — ALWAYS enabled now.
+    # Preview Mode toggle — ALWAYS enabled as requested.
     #
     # FIX: This used to rely SOLELY on a hardcoded absolute XPath
     # (section[8]) that was calibrated against the Manual creation form's
@@ -778,8 +829,9 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
     log_message("Enabling Preview Mode...")
     PREVIEW_MODE_TOGGLE_SELECTOR = "/html/body/div[3]/div[2]/main/div[2]/div/section[8]/div/div[2]/button"
     preview_toggle_label_xpath = (
-        "//p[contains(translate(., 'PREVIEW', 'preview'), 'preview')]"
-        "/ancestor::div[contains(@class, 'flex')][1]//button"
+        "//p[normalize-space()='Preview Mode']"
+        "/ancestor::div[contains(@class, 'justify-between') and contains(@class, 'rounded-xl')][1]"
+        "//button[@type='button']"
     )
 
     try:
@@ -796,21 +848,14 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", preview_toggle)
     time.sleep(1)
 
-    toggle_state_attr = preview_toggle.get_attribute("aria-checked")
-    toggle_class = (preview_toggle.get_attribute("class") or "").lower()
-    is_on = (
-        toggle_state_attr == "true"
-        or "bg-violet" in toggle_class
-        or "active" in toggle_class
-        or "on" in toggle_class
-    )
+    is_on = _toggle_is_on(preview_toggle)
 
-    if is_on:
-        log_message("Preview Mode toggle already ON.")
-    else:
+    if not is_on:
         _safe_click(preview_toggle)
         time.sleep(2)
         log_message("Preview Mode toggle enabled.")
+    else:
+        log_message("Preview Mode toggle already ON.")
 
     if campaign_type == "ai":
         run_btn_xpath = campaign_selectors.RUN_CAMPAIGN_BUTTON_SELECTOR
@@ -834,7 +879,7 @@ def create_campaign_steps(driver, provider, campaign_type, unique_campaign_name,
 
 def run_test_case(provider, campaign_type):
     """Executes a single test case for a combination of provider and campaign_type.
-    After creation (Preview Mode always on), this opens the campaign via the
+    After creation (Preview Mode on), this opens the campaign via the
     pencil 'Edit campaign' icon and verifies the Preview Mode toggle is ON
     before activating. After activation, once the Campaign Activities
     overview loads, it cycles between the Lead Activity and Email views
@@ -901,7 +946,7 @@ def run_test_case(provider, campaign_type):
         # EDIT CAMPAIGN -> VERIFY PREVIEW MODE TOGGLE IS ON
         # --------------------------------------
         current_step_title = f"Verify Preview Mode [{combo_label}]"
-        log_message("Opening campaign via Edit (pencil) icon to verify Preview Mode toggle...")
+        log_message("Opening campaign via Edit (pencil) icon to verify Preview Mode is ON...")
         driver.get(TARGET_URL.rstrip('/') + "/campaign")
         time.sleep(3)
 
@@ -931,8 +976,9 @@ def run_test_case(provider, campaign_type):
         # VERIFY: confirm this selector matches the Edit-campaign view DOM
         PREVIEW_MODE_TOGGLE_EDIT_SELECTOR = "/html/body/div[3]/div[2]/main/div[2]/div/section[8]/div/div[2]/button"
         preview_toggle_label_xpath = (
-            "//p[contains(translate(., 'PREVIEW', 'preview'), 'preview')]"
-            "/ancestor::div[contains(@class, 'flex')][1]//button"
+            "//p[normalize-space()='Preview Mode']"
+            "/ancestor::div[contains(@class, 'justify-between') and contains(@class, 'rounded-xl')][1]"
+            "//button[@type='button']"
         )
 
         try:
@@ -948,28 +994,23 @@ def run_test_case(provider, campaign_type):
         time.sleep(1)
 
         # VERIFY: state check via aria-checked, falling back to class heuristics
-        toggle_state_attr = preview_toggle.get_attribute("aria-checked")
-        toggle_class = (preview_toggle.get_attribute("class") or "").lower()
-        is_on = (
-            toggle_state_attr == "true"
-            or "bg-violet" in toggle_class
-            or "active" in toggle_class
-            or "on" in toggle_class
-        )
+        is_on = _toggle_is_on(preview_toggle)
 
         if is_on:
             log_message("Preview Mode toggle verified ON.")
             preview_note = "Preview Mode toggle verified ON."
         else:
-            log_message("Preview Mode toggle appears OFF — enabling it now.")
+            log_message("Preview Mode toggle is OFF — enabling it.")
             _safe_click(preview_toggle)
             time.sleep(1.5)
-            log_message("Preview Mode toggle enabled.")
-            preview_note = "Preview Mode toggle was OFF; enabled it now."
+            if not _toggle_is_on(preview_toggle):
+                raise AssertionError("Preview Mode remained OFF after enable click.")
+            preview_note = "Preview Mode was OFF; enabled."
 
         # Dedicated regression checks, reported separately from the normal
         # pipeline steps. These use this campaign's open edit form rather
         # than creating extra test campaigns.
+        verify_preview_toggle_persistence(driver, preview_toggle, campaign_type, combo_label)
         verify_advance_toggle_persistence(driver, campaign_type, combo_label)
         if campaign_type == "manual":
             verify_wait_duration(driver, campaign_type, combo_label)
@@ -982,10 +1023,20 @@ def run_test_case(provider, campaign_type):
             )
             _safe_click(save_or_close_btn)
             time.sleep(2)
-            log_message("Edit campaign view closed.")
+            log_message("Edit campaign form save/close action completed.")
         except Exception:
-            driver.get(TARGET_URL.rstrip('/') + "/campaign")
-            time.sleep(3)
+            log_message("No edit-form save/close button was available; returning to campaign list.")
+
+        # A Channel Sequence panel opened by the Manual bug check can leave
+        # the edit drawer mounted even after its inner Save button is clicked.
+        # Always return to the list and re-find the campaign before Activate;
+        # never reuse the pre-edit card locator.
+        driver.get(TARGET_URL.rstrip('/') + "/campaign")
+        WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+            EC.presence_of_element_located((By.XPATH, campaign_card_xpath))
+        )
+        time.sleep(2)
+        log_message("Returned to campaign list after edit-form bug checks.")
 
         record_step(current_step_title, preview_note)
 
@@ -1051,17 +1102,24 @@ def run_test_case(provider, campaign_type):
         # Activate the campaign
         # --------------------------------------
         current_step_title = f"Activate Campaign [{combo_label}]"
+        # Rebuild the card scope after every navigation. The previous scope
+        # belongs to the DOM before the edit drawer/sequence panel rendered.
+        fresh_card_wrapper_xpath = (
+            f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
+            f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
+        )
         activate_xpath = (
-            card_wrapper_xpath +
-            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'activate')"
-            " or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'start campaign')"
-            " or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'publish')"
-            " or contains(., 'Activate')]"
+            fresh_card_wrapper_xpath + "//button[normalize-space(.)='Activate']"
+            " | " + fresh_card_wrapper_xpath +
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'activate')"
+            " or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'start campaign')"
+            " or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'publish')]"
         )
 
         activate_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
             EC.element_to_be_clickable((By.XPATH, activate_xpath))
         )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", activate_btn)
         _safe_click(activate_btn)
         log_message("Campaign activated.")
         time.sleep(2)
@@ -1097,13 +1155,41 @@ def run_test_case(provider, campaign_type):
 
         record_step(current_step_title, "Campaign status showed 'Completed'.")
 
-        view_details_xpath = card_wrapper_xpath + "//button[contains(., 'View Details')]"
-        view_details_btn = WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
-            EC.element_to_be_clickable((By.XPATH, view_details_xpath))
-        )
-        _safe_click(view_details_btn)
-        time.sleep(3)
-        log_message("Campaign Activities overview opened.")
+        # Completion triggers a React refresh of the campaign card. Re-find
+        # View Details after refreshing instead of failing on a transient or
+        # stale post-completion card.
+        current_step_title = f"Open Campaign Activities [{combo_label}]"
+        activities_opened = False
+        for attempt in range(1, 4):
+            try:
+                if attempt > 1:
+                    driver.get(TARGET_URL.rstrip('/') + "/campaign")
+                    time.sleep(2)
+                WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                    EC.presence_of_element_located((By.XPATH, campaign_card_xpath))
+                )
+                fresh_card_wrapper_xpath = (
+                    f"//*[contains(@class,'card') or contains(@class,'campaign') or contains(@class,'rounded') or contains(@class,'border')]"
+                    f"[descendant::*[contains(normalize-space(.), '{unique_campaign_name}')]]"
+                )
+                view_details_xpath = fresh_card_wrapper_xpath + "//button[contains(normalize-space(.), 'View Details')]"
+                view_details_btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, view_details_xpath))
+                )
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", view_details_btn)
+                _safe_click(view_details_btn)
+                WebDriverWait(driver, EXPLICIT_WAIT_TIME).until(
+                    EC.presence_of_element_located((By.XPATH, EMAIL_CARD_XPATH))
+                )
+                activities_opened = True
+                log_message("Campaign Activities overview opened.")
+                break
+            except Exception as exc:
+                log_message(f"View Details navigation attempt {attempt}/3 failed: {clean_exception(exc)}")
+                time.sleep(2)
+
+        if not activities_opened:
+            raise TimeoutError("Could not open Campaign Activities / View Details after 3 attempts.")
 
         # --------------------------------------
         # LEAD ACTIVITY <-> EMAIL CYCLE (x2)
